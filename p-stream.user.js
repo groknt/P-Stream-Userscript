@@ -4,6 +4,7 @@
 // @version      1.0.0
 // @description  Userscript replacement for the P-Stream extension
 // @author       Duplicake, P-Stream Team
+// @icon         https://raw.githubusercontent.com/p-stream/p-stream/production/public/mstile-150x150.jpeg
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
