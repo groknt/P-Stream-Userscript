@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         P-Stream Userscript
+// @name         P-Stream (GrokNT Fork)
 // @namespace    https://pstream.mov/
 // @version      1.4.1
-// @description  Userscript replacement for the P-Stream extension
+// @description  P-Stream compatible UserScript
 // @author       Duplicake, P-Stream Team, groknt
 // @icon         https://raw.githubusercontent.com/p-stream/p-stream/production/public/mstile-150x150.jpeg
 // @match        *://pstream.mov/*
