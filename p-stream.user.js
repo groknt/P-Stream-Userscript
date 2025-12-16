@@ -11,6 +11,8 @@
 // @grant        unsafeWindow
 // @run-at       document-start
 // @connect      *
+// @updateURL    https://raw.githubusercontent.com/groknt/P-Stream-Userscript/main/p-stream.user.js
+// @downloadURL  https://raw.githubusercontent.com/groknt/P-Stream-Userscript/main/p-stream.user.js
 // ==/UserScript==
 
 (function () {
