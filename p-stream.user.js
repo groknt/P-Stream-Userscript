@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         P-Stream Userscript
 // @namespace    https://pstream.mov/
-// @version      1.4.0
+// @version      1.4.1
 // @description  Userscript replacement for the P-Stream extension
 // @author       Duplicake, P-Stream Team, groknt
 // @icon         https://raw.githubusercontent.com/p-stream/p-stream/production/public/mstile-150x150.jpeg
@@ -16,7 +16,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.4.0";
+  const VERSION = "1.4.1";
   const LOG_PREFIX = "P-Stream:";
 
   const CORS_HEADERS = Object.freeze({
@@ -77,6 +77,7 @@
 
   const proxyRules = new Map();
   const blobUrlRegistry = new Set();
+  const proxyCache = new Map();
   const patchStatus = { fetch: false, xhr: false, media: false };
 
   function logWarning(...args) {
@@ -263,31 +264,52 @@
     return url;
   }
 
-  async function proxyMediaSource(url) {
+  function cleanupStreamData() {
+    for (const blobUrl of blobUrlRegistry) {
+      try {
+        URL.revokeObjectURL(blobUrl);
+      } catch {}
+    }
+    blobUrlRegistry.clear();
+    proxyCache.clear();
+  }
+
+  function proxyMediaSource(url) {
     const normalizedUrl = normalizeUrl(url);
-    if (!normalizedUrl) return null;
+    if (!normalizedUrl) return Promise.resolve(null);
 
     const rule = findMatchingRule(normalizedUrl);
-    if (!rule) return null;
+    if (!rule) return Promise.resolve(null);
 
-    try {
-      const response = await executeGmRequest({
-        url: normalizedUrl,
-        method: "GET",
-        headers: rule.requestHeaders,
-        responseType: "arraybuffer",
-        withCredentials: true,
-      });
-
-      const contentType =
-        parseResponseHeaders(response.responseHeaders)["content-type"] || "";
-      if (isStreamingContent(contentType, normalizedUrl)) return null;
-
-      return createBlobUrl(responseToArrayBuffer(response), contentType);
-    } catch (error) {
-      logWarning("Media proxy failed:", error.message);
-      return null;
+    if (proxyCache.has(normalizedUrl)) {
+      return proxyCache.get(normalizedUrl);
     }
+
+    const proxyPromise = (async () => {
+      try {
+        const response = await executeGmRequest({
+          url: normalizedUrl,
+          method: "GET",
+          headers: rule.requestHeaders,
+          responseType: "arraybuffer",
+          withCredentials: true,
+        });
+
+        const contentType =
+          parseResponseHeaders(response.responseHeaders)["content-type"] || "";
+        if (isStreamingContent(contentType, normalizedUrl)) return null;
+
+        return createBlobUrl(responseToArrayBuffer(response), contentType);
+      } catch (error) {
+        logWarning("Media proxy failed:", error.message);
+        return null;
+      } finally {
+        setTimeout(() => proxyCache.delete(normalizedUrl), 1000);
+      }
+    })();
+
+    proxyCache.set(normalizedUrl, proxyPromise);
+    return proxyPromise;
   }
 
   function patchFetch() {
@@ -415,7 +437,7 @@
               this.responseText = this._nativeXhr.responseText;
             }
           }
-        } catch {} // Cross-origin restrictions
+        } catch {}
       }
 
       _bindNativeEvents() {
@@ -671,11 +693,13 @@
             return;
           }
 
-          proxyMediaSource(value)
-            .then((proxiedUrl) =>
-              originalSetter.call(element, proxiedUrl || value),
-            )
-            .catch(() => originalSetter.call(element, value));
+          originalSetter.call(element, value);
+
+          proxyMediaSource(value).then((proxiedUrl) => {
+            if (proxiedUrl && element.src === value) {
+              originalSetter.call(element, proxiedUrl);
+            }
+          });
         },
       });
     }
@@ -687,11 +711,13 @@
         return nativeSetAttribute.call(element, name, value);
       }
 
-      proxyMediaSource(value)
-        .then((proxiedUrl) =>
-          nativeSetAttribute.call(element, "src", proxiedUrl || value),
-        )
-        .catch(() => nativeSetAttribute.call(element, "src", value));
+      nativeSetAttribute.call(element, "src", value);
+
+      proxyMediaSource(value).then((proxiedUrl) => {
+        if (proxiedUrl && element.getAttribute("src") === value) {
+          nativeSetAttribute.call(element, "src", proxiedUrl);
+        }
+      });
     };
 
     globalContext.addEventListener("beforeunload", () => {
@@ -749,7 +775,7 @@
       if (contentType.includes("application/json")) {
         try {
           parsedBody = JSON.parse(text);
-        } catch {} // Keep as text
+        } catch {}
       }
 
       return {
@@ -765,6 +791,8 @@
 
     async prepareStream(body) {
       if (!body) throw new Error("Missing request body");
+
+      cleanupStreamData();
 
       const responseHeaders = {};
       if (body.responseHeaders) {
