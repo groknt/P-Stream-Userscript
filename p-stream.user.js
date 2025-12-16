@@ -1,732 +1,829 @@
 // ==UserScript==
 // @name         P-Stream Userscript
 // @namespace    https://pstream.mov/
-// @version      1.0.0
+// @version      1.4.0
 // @description  Userscript replacement for the P-Stream extension
-// @author       Duplicake, P-Stream Team
+// @author       Duplicake, P-Stream Team, groknt
 // @icon         https://raw.githubusercontent.com/p-stream/p-stream/production/public/mstile-150x150.jpeg
-// @match        *://*/*
+// @match        *://pstream.mov/*
+// @match        *://aether.mom/*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @run-at       document-start
 // @connect      *
-// @updateURL    https://raw.githubusercontent.com/p-stream/Userscript/main/p-stream.user.js
-// @downloadURL  https://raw.githubusercontent.com/p-stream/Userscript/main/p-stream.user.js
 // ==/UserScript==
 
 (function () {
-  'use strict';
+  "use strict";
 
-  // Environment bootstrap, report higher version to bypass extension version requirement.
-  const SCRIPT_VERSION = '1.4.0';
-  // Use unsafeWindow when available so our patches run in the page context.
-  const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-  const gmXhr =
-    typeof GM_xmlhttpRequest === 'function'
+  const VERSION = "1.4.0";
+  const LOG_PREFIX = "P-Stream:";
+
+  const CORS_HEADERS = Object.freeze({
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+    "access-control-allow-headers": "*",
+  });
+
+  const MODIFIABLE_HEADERS = new Set([
+    "access-control-allow-origin",
+    "access-control-allow-methods",
+    "access-control-allow-headers",
+    "content-security-policy",
+    "content-security-policy-report-only",
+    "content-disposition",
+  ]);
+
+  const STREAMING_EXTENSIONS_REGEX = /\.(m3u8|mpd)(?:\?|$)/i;
+  const STREAMING_MIME_TYPES = ["mpegurl", "dash+xml"];
+
+  const XHR_STATES = Object.freeze({
+    UNSENT: 0,
+    OPENED: 1,
+    HEADERS_RECEIVED: 2,
+    LOADING: 3,
+    DONE: 4,
+  });
+
+  const XHR_EVENT_TYPES = Object.freeze([
+    "readystatechange",
+    "load",
+    "error",
+    "timeout",
+    "abort",
+    "loadend",
+    "progress",
+    "loadstart",
+  ]);
+
+  const globalContext =
+    typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+
+  const gmXmlHttpRequest =
+    typeof GM_xmlhttpRequest === "function"
       ? GM_xmlhttpRequest
-      : typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function'
+      : typeof GM?.xmlHttpRequest === "function"
         ? GM.xmlHttpRequest
         : null;
 
-  // --- Constants & state -------------------------------------------------
-  const DEFAULT_CORS_HEADERS = {
-    'access-control-allow-origin': '*',
-    'access-control-allow-methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
-    'access-control-allow-headers': '*',
-  };
-  const MODIFIABLE_RESPONSE_HEADERS = [
-    'access-control-allow-origin',
-    'access-control-allow-methods',
-    'access-control-allow-headers',
-    'content-security-policy',
-    'content-security-policy-report-only',
-    'content-disposition',
-  ];
-
-  const STREAM_RULES = new Map();
-  const MEDIA_BLOBS = new Map();
-  let fetchPatched = false;
-  let xhrPatched = false;
-  let mediaPatched = false;
-
-  const REQUEST_ORIGIN = (() => {
+  const pageOrigin = (function () {
     try {
-      const { origin, href } = pageWindow.location;
-      if (origin && origin !== 'null') return origin;
-      if (href) return new URL(href).origin;
-    } catch {}
-    return '*';
+      const { origin, href } = globalContext.location;
+      return origin !== "null" ? origin : new URL(href).origin;
+    } catch {
+      return "*";
+    }
   })();
 
-  // --- Logging -----------------------------------------------------------
-  const log = (...args) => console.debug('[p-stream-userscript]', ...args);
+  const proxyRules = new Map();
+  const blobUrlRegistry = new Set();
+  const patchStatus = { fetch: false, xhr: false, media: false };
 
-  // --- Basic utilities ---------------------------------------------------
-  const canAccessCookies = () => true;
+  function logWarning(...args) {
+    console.warn(LOG_PREFIX, ...args);
+  }
 
-  const normalizeUrl = (input) => {
+  function logError(...args) {
+    console.error(LOG_PREFIX, ...args);
+  }
+
+  function normalizeUrl(input, base = globalContext.location.href) {
     if (!input) return null;
     try {
-      return new URL(input, pageWindow.location.href).toString();
+      return new URL(input, base).href;
     } catch {
       return null;
     }
-  };
+  }
 
-  const isSameOrigin = (url) => {
+  function isSameOrigin(url) {
     try {
-      return new URL(url).origin === new URL(pageWindow.location.href).origin;
+      return new URL(url).origin === pageOrigin;
     } catch {
       return false;
     }
-  };
+  }
 
-  const makeFullUrl = (url, ops = {}) => {
-    let leftSide = ops.baseUrl ?? '';
-    let rightSide = url;
-    if (leftSide.length > 0 && !leftSide.endsWith('/')) leftSide += '/';
-    if (rightSide.startsWith('/')) rightSide = rightSide.slice(1);
-    const fullUrl = leftSide + rightSide;
-    if (!fullUrl.startsWith('http://') && !fullUrl.startsWith('https://'))
-      throw new Error(`Invalid URL -- URL doesn't start with a http scheme: '${fullUrl}'`);
+  function buildUrl(url, options = {}) {
+    const { baseUrl = "", query = {} } = options;
+    const base = baseUrl.endsWith("/") ? baseUrl : baseUrl && `${baseUrl}/`;
+    const path = url.startsWith("/") ? url.slice(1) : url;
+    const fullUrl = `${base}${path}`;
+
+    if (!/^https?:\/\//i.test(fullUrl)) {
+      throw new Error(`Invalid URL scheme: ${fullUrl}`);
+    }
 
     const parsedUrl = new URL(fullUrl);
-    Object.entries(ops.query ?? {}).forEach(([k, v]) => parsedUrl.searchParams.set(k, v));
-    return parsedUrl.toString();
-  };
+    for (const [key, value] of Object.entries(query)) {
+      parsedUrl.searchParams.set(key, value);
+    }
+    return parsedUrl.href;
+  }
 
-  const parseHeaders = (raw) => {
+  function parseResponseHeaders(rawHeaders) {
     const headers = {};
-    (raw || '')
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .forEach((line) => {
-        const idx = line.indexOf(':');
-        if (idx === -1) return;
-        const key = line.slice(0, idx).trim();
-        const value = line.slice(idx + 1).trim();
-        headers[key.toLowerCase()] = headers[key.toLowerCase()]
-          ? `${headers[key.toLowerCase()]}, ${value}`
-          : value;
-      });
-    return headers;
-  };
+    if (!rawHeaders) return headers;
 
-  const buildResponseHeaders = (rawHeaders, ruleHeaders, includeCredentials) => {
-    const headerMap = {
-      ...DEFAULT_CORS_HEADERS,
-      ...(ruleHeaders ?? {}),
-      ...parseHeaders(rawHeaders),
+    for (const line of rawHeaders.split(/\r?\n/)) {
+      const separatorIndex = line.indexOf(":");
+      if (separatorIndex === -1) continue;
+
+      const key = line.slice(0, separatorIndex).trim().toLowerCase();
+      const value = line.slice(separatorIndex + 1).trim();
+      headers[key] = headers[key] ? `${headers[key]}, ${value}` : value;
+    }
+    return headers;
+  }
+
+  function buildResponseHeaders(rawHeaders, ruleHeaders, includeCredentials) {
+    const headers = {
+      ...CORS_HEADERS,
+      ...ruleHeaders,
+      ...parseResponseHeaders(rawHeaders),
     };
 
     if (includeCredentials) {
-      headerMap['access-control-allow-credentials'] = 'true';
-      if (!headerMap['access-control-allow-origin'] || headerMap['access-control-allow-origin'] === '*') {
-        headerMap['access-control-allow-origin'] = REQUEST_ORIGIN;
+      headers["access-control-allow-credentials"] = "true";
+      if (
+        !headers["access-control-allow-origin"] ||
+        headers["access-control-allow-origin"] === "*"
+      ) {
+        headers["access-control-allow-origin"] = pageOrigin;
       }
     }
 
-    return headerMap;
-  };
+    return headers;
+  }
 
-  // --- Request helpers ---------------------------------------------------
-  const mapBodyToPayload = (body, bodyType) => {
+  function shouldIncludeCredentials(
+    url,
+    credentialsMode,
+    forceInclude = false,
+  ) {
+    if (forceInclude || credentialsMode === "include") return true;
+    if (credentialsMode === "omit") return false;
+    return isSameOrigin(url);
+  }
+
+  function normalizeRequestBody(body) {
     if (body == null) return undefined;
+    if (
+      typeof body === "string" ||
+      body instanceof FormData ||
+      body instanceof Blob ||
+      body instanceof ArrayBuffer ||
+      ArrayBuffer.isView(body)
+    ) {
+      return body;
+    }
+    if (body instanceof URLSearchParams) return body.toString();
+    if (typeof body === "object") return JSON.stringify(body);
+    return body;
+  }
+
+  function deserializeRequestBody(body, bodyType) {
+    if (body == null) return undefined;
+
     switch (bodyType) {
-      case 'FormData': {
+      case "FormData": {
         const formData = new FormData();
-        body.forEach(([key, value]) => formData.append(key, value));
+        for (const [key, value] of body) {
+          formData.append(key, value);
+        }
         return formData;
       }
-      case 'URLSearchParams':
+      case "URLSearchParams":
         return new URLSearchParams(body);
-      case 'object':
+      case "object":
         return JSON.stringify(body);
-      case 'string':
-        return body;
       default:
         return body;
     }
-  };
+  }
 
-  const normalizeBody = (body) => {
-    if (body == null) return undefined;
-    if (body instanceof URLSearchParams) return body.toString();
-    if (typeof body === 'string' || body instanceof FormData || body instanceof Blob) return body;
-    if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return body;
-    if (typeof body === 'object') return JSON.stringify(body);
-    return body;
-  };
-
-  const gmRequest = (options) =>
-    new Promise((resolve, reject) => {
-      if (!gmXhr) {
-        reject(new Error('GM_xmlhttpRequest missing; cannot proxy request'));
+  function executeGmRequest(options) {
+    return new Promise((resolve, reject) => {
+      if (!gmXmlHttpRequest) {
+        reject(new Error("GM_xmlhttpRequest unavailable"));
         return;
       }
-      gmXhr({
+
+      gmXmlHttpRequest({
         ...options,
-        onload: (response) => resolve(response),
-        onerror: (error) => reject(error),
-        ontimeout: () => reject(new Error('Request timed out')),
+        onload: resolve,
+        onerror: (error) => reject(new Error(error?.error || "Network error")),
+        ontimeout: () => reject(new Error("Request timeout")),
       });
     });
+  }
 
-  const shouldSendCredentials = (url, credentialsMode, withCredentialsFlag = false) => {
-    if (!url) return false;
-    if (withCredentialsFlag) return true;
-    const sameOrigin = isSameOrigin(url);
+  function responseToArrayBuffer(response) {
+    return response.response instanceof ArrayBuffer
+      ? response.response
+      : new TextEncoder().encode(response.responseText || "");
+  }
 
-    if (credentialsMode === 'omit') return false;
-    if (credentialsMode === 'include') return true;
-    if (!credentialsMode || credentialsMode === 'same-origin') return sameOrigin || canAccessCookies();
-    return canAccessCookies();
-  };
+  function findMatchingRule(url) {
+    const normalizedUrl = normalizeUrl(url);
+    if (!normalizedUrl) return null;
 
-  const findRuleForUrl = (url) => {
-    const normalized = normalizeUrl(url);
-    if (!normalized) return null;
-    const host = new URL(normalized).hostname;
-    for (const rule of STREAM_RULES.values()) {
-      if (rule.targetDomains?.some((d) => host === d || host.endsWith(`.${d}`))) return rule;
+    const hostname = new URL(normalizedUrl).hostname;
+
+    for (const rule of proxyRules.values()) {
+      if (rule.targetDomains?.length) {
+        const domainMatches = rule.targetDomains.some(
+          (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
+        );
+        if (domainMatches) return rule;
+      }
+
       if (rule.targetRegex) {
         try {
-          const regex = new RegExp(rule.targetRegex);
-          if (regex.test(normalized)) return rule;
-        } catch (err) {
-          log('Invalid targetRegex in rule, skipping', err);
+          if (new RegExp(rule.targetRegex).test(normalizedUrl)) return rule;
+        } catch (error) {
+          logWarning("Invalid rule regex:", error.message);
         }
       }
     }
+
     return null;
-  };
+  }
 
-  // --- Media helpers -----------------------------------------------------
-  const makeBlobUrl = (data, contentType) => {
-    const blob = new Blob([data], { type: contentType || 'application/octet-stream' });
-    return URL.createObjectURL(blob);
-  };
+  function isStreamingContent(contentType, url) {
+    return (
+      STREAMING_MIME_TYPES.some((mimeType) => contentType.includes(mimeType)) ||
+      STREAMING_EXTENSIONS_REGEX.test(url)
+    );
+  }
 
-  const proxyMediaIfNeeded = async (url) => {
-    const normalized = normalizeUrl(url);
-    if (!normalized) return null;
-    const rule = findRuleForUrl(normalized);
+  function createBlobUrl(data, contentType = "application/octet-stream") {
+    const url = URL.createObjectURL(new Blob([data], { type: contentType }));
+    blobUrlRegistry.add(url);
+    return url;
+  }
+
+  async function proxyMediaSource(url) {
+    const normalizedUrl = normalizeUrl(url);
+    if (!normalizedUrl) return null;
+
+    const rule = findMatchingRule(normalizedUrl);
     if (!rule) return null;
+
     try {
-      const includeCredentials = shouldSendCredentials(normalized, 'include', true);
-      const response = await gmRequest({
-        url: normalized,
-        method: 'GET',
+      const response = await executeGmRequest({
+        url: normalizedUrl,
+        method: "GET",
         headers: rule.requestHeaders,
-        responseType: 'arraybuffer',
-        withCredentials: includeCredentials,
+        responseType: "arraybuffer",
+        withCredentials: true,
       });
-      const headers = parseHeaders(response.responseHeaders);
-      const contentType = headers['content-type'] || '';
 
-      if (
-        contentType.includes('application/vnd.apple.mpegurl') ||
-        contentType.includes('application/x-mpegurl') ||
-        normalized.includes('.m3u8')
-      ) {
-        return null;
-      }
-      if (contentType.includes('application/dash+xml') || normalized.includes('.mpd')) return null;
+      const contentType =
+        parseResponseHeaders(response.responseHeaders)["content-type"] || "";
+      if (isStreamingContent(contentType, normalizedUrl)) return null;
 
-      const blobUrl = makeBlobUrl(
-        response.response instanceof ArrayBuffer ? response.response : new TextEncoder().encode(response.responseText ?? ''),
-        contentType,
-      );
-      MEDIA_BLOBS.set(blobUrl, true);
-      return blobUrl;
-    } catch (err) {
-      log('Media proxy failed, falling back to original src', err);
+      return createBlobUrl(responseToArrayBuffer(response), contentType);
+    } catch (error) {
+      logWarning("Media proxy failed:", error.message);
       return null;
     }
-  };
+  }
 
-  // --- Proxy initializers ------------------------------------------------
-  const ensureFetchProxy = () => {
-    if (fetchPatched) return;
-    fetchPatched = true;
-    const win = pageWindow;
-    const nativeFetch = win.fetch.bind(win);
+  function patchFetch() {
+    if (patchStatus.fetch) return;
+    patchStatus.fetch = true;
 
-    win.fetch = async (input, init = {}) => {
-      const targetUrl = normalizeUrl(typeof input === 'string' ? input : input?.url);
-      if (!targetUrl) return nativeFetch(input, init);
-      const rule = findRuleForUrl(targetUrl);
+    const nativeFetch = globalContext.fetch.bind(globalContext);
+
+    globalContext.fetch = async function (input, init = {}) {
+      const url = normalizeUrl(typeof input === "string" ? input : input?.url);
+      const rule = url && findMatchingRule(url);
+
       if (!rule) return nativeFetch(input, init);
 
-      const headers = {};
-      const initHeaders = init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : init.headers;
-      Object.assign(headers, rule.requestHeaders ?? {}, initHeaders ?? {});
+      const headers = {
+        ...rule.requestHeaders,
+        ...(init.headers instanceof Headers
+          ? Object.fromEntries(init.headers)
+          : init.headers),
+      };
 
-      const method = init.method || 'GET';
-      const payload = normalizeBody(init.body);
-      const includeCredentials = shouldSendCredentials(targetUrl, init.credentials);
+      const includeCredentials = shouldIncludeCredentials(
+        url,
+        init.credentials,
+      );
 
       try {
-        const response = await gmRequest({
-          url: targetUrl,
-          method,
-          data: payload,
+        const response = await executeGmRequest({
+          url,
+          method: init.method || "GET",
           headers,
-          responseType: 'arraybuffer',
+          data: normalizeRequestBody(init.body),
+          responseType: "arraybuffer",
           withCredentials: includeCredentials,
         });
 
-        const headerMap = buildResponseHeaders(response.responseHeaders, rule.responseHeaders, includeCredentials);
-        const bodyBuffer =
-          response.response instanceof ArrayBuffer
-            ? response.response
-            : new TextEncoder().encode(response.responseText ?? '');
-
-        return new Response(bodyBuffer, {
+        return new Response(responseToArrayBuffer(response), {
           status: response.status,
-          statusText: response.statusText ?? '',
-          headers: headerMap,
+          statusText: response.statusText || "",
+          headers: buildResponseHeaders(
+            response.responseHeaders,
+            rule.responseHeaders,
+            includeCredentials,
+          ),
         });
-      } catch (err) {
-        log('Proxy fetch failed, falling back to native', err);
+      } catch (error) {
+        logWarning("Fetch proxy failed:", error.message);
         return nativeFetch(input, init);
       }
     };
-  };
+  }
 
-  const ensureXhrProxy = () => {
-    if (xhrPatched) return;
-    xhrPatched = true;
-    const win = pageWindow;
-    const NativeXHR = win.XMLHttpRequest;
+  function patchXhr() {
+    if (patchStatus.xhr) return;
+    patchStatus.xhr = true;
 
-    const EVENTS = ['readystatechange', 'load', 'error', 'timeout', 'abort', 'loadend', 'progress', 'loadstart'];
+    const NativeXMLHttpRequest = globalContext.XMLHttpRequest;
 
-    const emit = (instance, type, event = new Event(type)) => {
-      try {
-        instance[`on${type}`]?.call(instance, event);
-      } catch (err) {
-        log('XHR handler error', err);
-      }
-      (instance._listeners.get(type) || []).forEach((cb) => {
-        try {
-          cb.call(instance, event);
-        } catch (err) {
-          log('XHR listener error', err);
-        }
-      });
-    };
-
-    class ProxyXHR {
+    class ProxyXMLHttpRequest {
       constructor() {
-        this._native = new NativeXHR();
-        this._usingNative = true;
-        this._listeners = new Map();
-        this._headers = {};
-        this._rule = null;
-        this._url = '';
-        this._method = 'GET';
+        this._nativeXhr = new NativeXMLHttpRequest();
+        this._useNative = true;
+        this._eventListeners = new Map();
+        this._requestHeaders = {};
         this._responseHeaders = {};
-        this._readyState = ProxyXHR.UNSENT;
-        this._status = 0;
-        this._statusText = '';
-        this._response = null;
-        this._responseText = '';
-        this._responseURL = '';
-        this._overrideMime = '';
-        this.responseType = '';
+        this._matchedRule = null;
+        this._requestUrl = "";
+        this._requestMethod = "GET";
+        this._isAborted = false;
+        this._timeoutId = null;
+        this._overriddenMimeType = "";
+        this._nativeEventsBound = false;
+
+        this.readyState = XHR_STATES.UNSENT;
+        this.status = 0;
+        this.statusText = "";
+        this.response = null;
+        this.responseText = "";
+        this.responseURL = "";
+        this.responseType = "";
         this.withCredentials = false;
         this.timeout = 0;
-        this.upload = this._native.upload;
+        this.upload = this._nativeXhr.upload;
       }
 
-      get readyState() {
-        return this._usingNative ? this._native.readyState : this._readyState;
+      _emitEvent(eventType, event = new Event(eventType)) {
+        const handler = this[`on${eventType}`];
+        if (handler) {
+          try {
+            handler.call(this, event);
+          } catch (error) {
+            logError("XHR handler error:", error);
+          }
+        }
+
+        const listeners = this._eventListeners.get(eventType);
+        if (listeners) {
+          for (const listener of listeners) {
+            try {
+              listener.call(this, event);
+            } catch (error) {
+              logError("XHR listener error:", error);
+            }
+          }
+        }
       }
 
-      set readyState(value) {
-        this._readyState = value;
-      }
+      _syncFromNative() {
+        if (!this._useNative) return;
 
-      get status() {
-        return this._usingNative ? this._native.status : this._status;
-      }
+        try {
+          this.readyState = this._nativeXhr.readyState;
 
-      set status(value) {
-        this._status = value;
-      }
+          if (this.readyState >= XHR_STATES.HEADERS_RECEIVED) {
+            this.status = this._nativeXhr.status;
+            this.statusText = this._nativeXhr.statusText;
+          }
 
-      get statusText() {
-        return this._usingNative ? this._native.statusText : this._statusText;
-      }
+          if (this.readyState === XHR_STATES.DONE) {
+            this.response = this._nativeXhr.response;
+            this.responseURL = this._nativeXhr.responseURL;
 
-      set statusText(value) {
-        this._statusText = value;
-      }
-
-      get response() {
-        return this._usingNative ? this._native.response : this._response;
-      }
-
-      set response(value) {
-        this._response = value;
-      }
-
-      get responseText() {
-        return this._usingNative ? this._native.responseText : this._responseText;
-      }
-
-      set responseText(value) {
-        this._responseText = value;
-      }
-
-      get responseURL() {
-        return this._usingNative ? this._native.responseURL : this._responseURL;
-      }
-
-      set responseURL(value) {
-        this._responseURL = value;
-      }
-
-      addEventListener(type, callback) {
-        if (!this._listeners.has(type)) this._listeners.set(type, []);
-        this._listeners.get(type).push(callback);
-        if (this._usingNative) return this._native.addEventListener(type, callback);
-      }
-
-      removeEventListener(type, callback) {
-        const listeners = this._listeners.get(type);
-        if (!listeners) return;
-        const idx = listeners.indexOf(callback);
-        if (idx !== -1) listeners.splice(idx, 1);
-        if (this._usingNative) return this._native.removeEventListener(type, callback);
+            const responseType = this._nativeXhr.responseType;
+            if (!responseType || responseType === "text") {
+              this.responseText = this._nativeXhr.responseText;
+            }
+          }
+        } catch {} // Cross-origin restrictions
       }
 
       _bindNativeEvents() {
-        if (this._nativeBound) return;
-        this._nativeBound = true;
-        EVENTS.forEach((type) => {
-          this._native.addEventListener(type, (event) => emit(this, type, event));
-        });
-      }
+        if (this._nativeEventsBound) return;
+        this._nativeEventsBound = true;
 
-      open(method, url, async = true, user, password) {
-        this._method = method;
-        const normalized = normalizeUrl(url);
-        this._url = normalized ?? url;
-        this._rule = normalized ? findRuleForUrl(normalized) : null;
-        this._usingNative = !this._rule;
-
-        if (this._usingNative) {
-          return this._native.open(method, url, async, user, password);
+        for (const eventType of XHR_EVENT_TYPES) {
+          this._nativeXhr.addEventListener(eventType, (event) => {
+            this._syncFromNative();
+            this._emitEvent(eventType, event);
+          });
         }
-
-        this.readyState = ProxyXHR.OPENED;
-        emit(this, 'readystatechange');
       }
 
-      setRequestHeader(name, value) {
-        if (this._usingNative) return this._native.setRequestHeader(name, value);
-        this._headers[name] = value;
-      }
+      _setResponseData(buffer) {
+        const contentType =
+          this.getResponseHeader("content-type") ||
+          this._overriddenMimeType ||
+          "application/octet-stream";
 
-      getResponseHeader(name) {
-        if (this._usingNative) return this._native.getResponseHeader(name);
-        const key = name?.toLowerCase?.() ?? '';
-        return this._responseHeaders[key] ?? null;
-      }
+        switch (this.responseType) {
+          case "arraybuffer":
+            this.response = buffer;
+            break;
 
-      getAllResponseHeaders() {
-        if (this._usingNative) return this._native.getAllResponseHeaders();
-        return Object.entries(this._responseHeaders)
-          .map(([k, v]) => `${k}: ${v}`)
-          .join('\r\n');
-      }
+          case "blob":
+            this.response = new Blob([buffer], { type: contentType });
+            break;
 
-      overrideMimeType(mime) {
-        if (this._usingNative) return this._native.overrideMimeType(mime);
-        this._overrideMime = mime;
-      }
-
-      abort() {
-        if (this._usingNative) return this._native.abort();
-        if (this._timeoutId) clearTimeout(this._timeoutId);
-        this._aborted = true;
-        this.readyState = ProxyXHR.UNSENT;
-        emit(this, 'abort');
-      }
-
-      _applyTimeout(promise) {
-        if (!this.timeout) return promise;
-        return Promise.race([
-          promise,
-          new Promise((_, reject) => {
-            this._timeoutId = setTimeout(() => reject(new Error('timeout')), this.timeout);
-          }),
-        ]);
-      }
-
-      async send(body = null) {
-        if (this._usingNative) {
-          this._native.withCredentials = this.withCredentials;
-          this._native.responseType = this.responseType;
-          this._native.timeout = this.timeout;
-          this._bindNativeEvents();
-          return this._native.send(body);
-        }
-
-        const rule = this._rule;
-        if (!rule) return;
-        const headers = { ...(rule.requestHeaders ?? {}), ...this._headers };
-        const includeCredentials = shouldSendCredentials(this._url, this.withCredentials ? 'include' : undefined, this.withCredentials);
-
-        try {
-          emit(this, 'loadstart');
-          const response = await this._applyTimeout(
-            gmRequest({
-              url: this._url,
-              method: this._method || 'GET',
-              data: normalizeBody(body),
-              headers,
-              responseType: this.responseType === 'arraybuffer' || this.responseType === 'blob' ? 'arraybuffer' : 'text',
-              withCredentials: includeCredentials,
-            }),
-          );
-
-          if (this._timeoutId) clearTimeout(this._timeoutId);
-          if (this._aborted) return;
-
-          const headerMap = buildResponseHeaders(response.responseHeaders, rule.responseHeaders, includeCredentials);
-          this._responseHeaders = Object.fromEntries(Object.entries(headerMap).map(([k, v]) => [k.toLowerCase(), v]));
-
-          const responseUrl = response.finalUrl || this._url;
-          this.responseURL = responseUrl;
-          this.status = response.status;
-          this.statusText = response.statusText ?? '';
-          const bodyBuffer =
-            response.response instanceof ArrayBuffer
-              ? response.response
-              : new TextEncoder().encode(response.responseText ?? '');
-
-          this.readyState = ProxyXHR.HEADERS_RECEIVED;
-          emit(this, 'readystatechange');
-          this.readyState = ProxyXHR.LOADING;
-          emit(this, 'readystatechange');
-
-          if (this.responseType === 'arraybuffer') {
-            this.response = bodyBuffer;
-          } else if (this.responseType === 'blob') {
-            this.response = new Blob([bodyBuffer], {
-              type: this.getResponseHeader('content-type') || this._overrideMime || 'application/octet-stream',
-            });
-          } else if (this.responseType === 'json') {
-            const text = new TextDecoder().decode(bodyBuffer);
+          case "json": {
+            const text = new TextDecoder().decode(buffer);
             this.responseText = text;
             try {
               this.response = JSON.parse(text);
             } catch {
               this.response = null;
             }
-          } else {
-            this.response = new TextDecoder().decode(bodyBuffer);
-            this.responseText = this.response;
+            break;
           }
 
-          this.readyState = ProxyXHR.DONE;
-          emit(this, 'readystatechange');
-          emit(this, 'load');
-          emit(this, 'loadend');
-        } catch (err) {
-          if (this._timeoutId) clearTimeout(this._timeoutId);
-          if (this._aborted) return;
+          default: {
+            const text = new TextDecoder().decode(buffer);
+            this.response = text;
+            this.responseText = text;
+          }
+        }
+      }
+
+      addEventListener(eventType, callback) {
+        if (!this._eventListeners.has(eventType)) {
+          this._eventListeners.set(eventType, []);
+        }
+        this._eventListeners.get(eventType).push(callback);
+
+        if (this._useNative) {
+          this._nativeXhr.addEventListener(eventType, callback);
+        }
+      }
+
+      removeEventListener(eventType, callback) {
+        const listeners = this._eventListeners.get(eventType);
+        if (listeners) {
+          const index = listeners.indexOf(callback);
+          if (index !== -1) listeners.splice(index, 1);
+        }
+
+        if (this._useNative) {
+          this._nativeXhr.removeEventListener(eventType, callback);
+        }
+      }
+
+      open(method, url, async = true, username, password) {
+        this._requestMethod = method;
+        this._requestUrl = normalizeUrl(url) || url;
+        this._matchedRule = findMatchingRule(this._requestUrl);
+        this._useNative = !this._matchedRule;
+
+        if (this._useNative) {
+          return this._nativeXhr.open(method, url, async, username, password);
+        }
+
+        this.readyState = XHR_STATES.OPENED;
+        this._emitEvent("readystatechange");
+      }
+
+      setRequestHeader(name, value) {
+        if (this._useNative) {
+          return this._nativeXhr.setRequestHeader(name, value);
+        }
+        this._requestHeaders[name] = value;
+      }
+
+      getResponseHeader(name) {
+        if (this._useNative) {
+          return this._nativeXhr.getResponseHeader(name);
+        }
+        return this._responseHeaders[name?.toLowerCase()] ?? null;
+      }
+
+      getAllResponseHeaders() {
+        if (this._useNative) {
+          return this._nativeXhr.getAllResponseHeaders();
+        }
+        return Object.entries(this._responseHeaders)
+          .map(([key, value]) => `${key}: ${value}`)
+          .join("\r\n");
+      }
+
+      overrideMimeType(mimeType) {
+        if (this._useNative) {
+          return this._nativeXhr.overrideMimeType(mimeType);
+        }
+        this._overriddenMimeType = mimeType;
+      }
+
+      abort() {
+        if (this._useNative) {
+          return this._nativeXhr.abort();
+        }
+
+        if (this._timeoutId) {
+          clearTimeout(this._timeoutId);
+          this._timeoutId = null;
+        }
+
+        this._isAborted = true;
+        this.readyState = XHR_STATES.UNSENT;
+        this._emitEvent("abort");
+      }
+
+      async send(body = null) {
+        if (this._useNative) {
+          this._nativeXhr.withCredentials = this.withCredentials;
+          this._nativeXhr.responseType = this.responseType;
+          this._nativeXhr.timeout = this.timeout;
+          this._bindNativeEvents();
+          return this._nativeXhr.send(body);
+        }
+
+        const rule = this._matchedRule;
+        const url = this._requestUrl;
+        const method = this._requestMethod;
+
+        const headers = { ...rule.requestHeaders, ...this._requestHeaders };
+        const includeCredentials = shouldIncludeCredentials(
+          url,
+          this.withCredentials ? "include" : undefined,
+          this.withCredentials,
+        );
+        const binaryResponse =
+          this.responseType === "arraybuffer" || this.responseType === "blob";
+
+        const requestPromise = executeGmRequest({
+          url,
+          method,
+          headers,
+          data: normalizeRequestBody(body),
+          responseType: binaryResponse ? "arraybuffer" : "text",
+          withCredentials: includeCredentials,
+        });
+
+        let timeoutPromise = null;
+        if (this.timeout > 0) {
+          timeoutPromise = new Promise((_, reject) => {
+            this._timeoutId = setTimeout(
+              () => reject(new Error("timeout")),
+              this.timeout,
+            );
+          });
+        }
+
+        this._emitEvent("loadstart");
+
+        try {
+          const response = await (timeoutPromise
+            ? Promise.race([requestPromise, timeoutPromise])
+            : requestPromise);
+
+          if (this._timeoutId) {
+            clearTimeout(this._timeoutId);
+            this._timeoutId = null;
+          }
+
+          if (this._isAborted) return;
+
+          this._responseHeaders = buildResponseHeaders(
+            response.responseHeaders,
+            rule.responseHeaders,
+            includeCredentials,
+          );
+          this.responseURL = response.finalUrl || url;
+          this.status = response.status;
+          this.statusText = response.statusText || "";
+
+          const buffer = responseToArrayBuffer(response);
+
+          this.readyState = XHR_STATES.HEADERS_RECEIVED;
+          this._emitEvent("readystatechange");
+
+          this.readyState = XHR_STATES.LOADING;
+          this._emitEvent("readystatechange");
+
+          this._setResponseData(buffer);
+
+          this.readyState = XHR_STATES.DONE;
+          this._emitEvent("readystatechange");
+          this._emitEvent("load");
+          this._emitEvent("loadend");
+        } catch (error) {
+          if (this._timeoutId) {
+            clearTimeout(this._timeoutId);
+            this._timeoutId = null;
+          }
+
+          if (this._isAborted) return;
+
           this.status = 0;
-          this.statusText = err?.message ?? '';
-          this.readyState = ProxyXHR.DONE;
-          emit(this, 'readystatechange');
-          emit(this, err?.message === 'timeout' ? 'timeout' : 'error');
-          emit(this, 'loadend');
+          this.statusText = error.message || "";
+          this.readyState = XHR_STATES.DONE;
+
+          this._emitEvent("readystatechange");
+          this._emitEvent(error.message === "timeout" ? "timeout" : "error");
+          this._emitEvent("loadend");
         }
       }
     }
 
-    ProxyXHR.UNSENT = 0;
-    ProxyXHR.OPENED = 1;
-    ProxyXHR.HEADERS_RECEIVED = 2;
-    ProxyXHR.LOADING = 3;
-    ProxyXHR.DONE = 4;
+    Object.assign(ProxyXMLHttpRequest, XHR_STATES);
+    globalContext.XMLHttpRequest = ProxyXMLHttpRequest;
+  }
 
-    win.XMLHttpRequest = ProxyXHR;
-  };
+  function patchMediaElements() {
+    if (patchStatus.media) return;
+    patchStatus.media = true;
 
-  const ensureMediaProxy = () => {
-    if (mediaPatched) return;
-    mediaPatched = true;
-    const win = pageWindow;
+    const mediaPrototype = globalContext.HTMLMediaElement.prototype;
+    const srcDescriptor = Object.getOwnPropertyDescriptor(
+      mediaPrototype,
+      "src",
+    );
+    const nativeSetAttribute = mediaPrototype.setAttribute;
 
-    const srcDescriptor = Object.getOwnPropertyDescriptor(win.HTMLMediaElement.prototype, 'src');
-    if (srcDescriptor && srcDescriptor.set) {
-      Object.defineProperty(win.HTMLMediaElement.prototype, 'src', {
+    if (srcDescriptor?.set) {
+      const originalSetter = srcDescriptor.set;
+
+      Object.defineProperty(mediaPrototype, "src", {
         ...srcDescriptor,
-        async set(value) {
-          if (typeof value === 'string') {
-            const proxied = await proxyMediaIfNeeded(value);
-            return srcDescriptor.set.call(this, proxied || value);
+        set(value) {
+          const element = this;
+
+          if (typeof value !== "string") {
+            originalSetter.call(element, value);
+            return;
           }
-          return srcDescriptor.set.call(this, value);
+
+          proxyMediaSource(value)
+            .then((proxiedUrl) =>
+              originalSetter.call(element, proxiedUrl || value),
+            )
+            .catch(() => originalSetter.call(element, value));
         },
       });
     }
 
-    // Only override setAttribute on media elements to improve performance
-    const originalMediaSetAttribute = win.HTMLMediaElement.prototype.setAttribute;
-    win.HTMLMediaElement.prototype.setAttribute = async function (name, value) {
-      if (typeof name === 'string' && name.toLowerCase() === 'src' && typeof value === 'string') {
-        const proxied = await proxyMediaIfNeeded(value);
-        return originalMediaSetAttribute.call(this, name, proxied || value);
+    mediaPrototype.setAttribute = function (name, value) {
+      const element = this;
+
+      if (name?.toLowerCase() !== "src" || typeof value !== "string") {
+        return nativeSetAttribute.call(element, name, value);
       }
-      return originalMediaSetAttribute.call(this, name, value);
+
+      proxyMediaSource(value)
+        .then((proxiedUrl) =>
+          nativeSetAttribute.call(element, "src", proxiedUrl || value),
+        )
+        .catch(() => nativeSetAttribute.call(element, "src", value));
     };
 
-    win.addEventListener('beforeunload', () => {
-      MEDIA_BLOBS.forEach((_, blobUrl) => URL.revokeObjectURL(blobUrl));
-      MEDIA_BLOBS.clear();
-    });
-  };
-
-  const ensureAllProxies = () => {
-    ensureFetchProxy();
-    ensureXhrProxy();
-    ensureMediaProxy();
-  };
-
-  // --- Message handlers --------------------------------------------------
-  const handleHello = async () => ({
-    success: true,
-    version: SCRIPT_VERSION,
-    allowed: true,
-    hasPermission: true,
-  });
-
-  const handleMakeRequest = async (reqBody) => {
-    if (!reqBody) throw new Error('No request body found in the request.');
-    const url = makeFullUrl(reqBody.url, reqBody);
-    const includeCredentials = shouldSendCredentials(url, reqBody.credentials, reqBody.withCredentials);
-
-    const response = await gmRequest({
-      url,
-      method: reqBody.method || 'GET',
-      headers: reqBody.headers,
-      data: mapBodyToPayload(reqBody.body, reqBody.bodyType),
-      responseType: 'arraybuffer',
-      withCredentials: includeCredentials,
-    });
-
-    const headers = buildResponseHeaders(response.responseHeaders, null, includeCredentials);
-    const contentType = headers['content-type'] || '';
-    let parsedBody;
-
-    try {
-      if (contentType.includes('application/json')) {
-        const textBody =
-          response.response instanceof ArrayBuffer
-            ? new TextDecoder().decode(response.response)
-            : response.responseText ?? '';
-        parsedBody = JSON.parse(textBody);
-      } else if (response.response instanceof ArrayBuffer) {
-        parsedBody = new TextDecoder().decode(response.response);
-      } else {
-        parsedBody = response.responseText ?? '';
+    globalContext.addEventListener("beforeunload", () => {
+      for (const url of blobUrlRegistry) {
+        URL.revokeObjectURL(url);
       }
-    } catch (err) {
-      log('Failed to parse response body, returning raw text', err);
-      parsedBody = response.responseText ?? '';
-    }
-
-    return {
-      success: true,
-      response: {
-        statusCode: response.status,
-        headers,
-        finalUrl: response.finalUrl || url,
-        body: parsedBody,
-      },
-    };
-  };
-
-  const handlePrepareStream = async (reqBody) => {
-    if (!reqBody) throw new Error('No request body found in the request.');
-    const responseHeaders = Object.entries(reqBody.responseHeaders ?? {}).reduce((acc, [k, v]) => {
-      const key = k.toLowerCase();
-      if (MODIFIABLE_RESPONSE_HEADERS.includes(key)) acc[key] = v;
-      return acc;
-    }, {});
-
-    STREAM_RULES.set(reqBody.ruleId, {
-      ...reqBody,
-      responseHeaders,
+      blobUrlRegistry.clear();
     });
-    ensureAllProxies();
-    return { success: true };
+  }
+
+  function installProxies() {
+    patchFetch();
+    patchXhr();
+    patchMediaElements();
+  }
+
+  const messageHandlers = {
+    hello() {
+      return {
+        success: true,
+        version: VERSION,
+        allowed: true,
+        hasPermission: true,
+      };
+    },
+
+    async makeRequest(body) {
+      if (!body) throw new Error("Missing request body");
+
+      const url = buildUrl(body.url, body);
+      const includeCredentials = shouldIncludeCredentials(
+        url,
+        body.credentials,
+        body.withCredentials,
+      );
+
+      const response = await executeGmRequest({
+        url,
+        method: body.method || "GET",
+        headers: body.headers,
+        data: deserializeRequestBody(body.body, body.bodyType),
+        responseType: "arraybuffer",
+        withCredentials: includeCredentials,
+      });
+
+      const headers = buildResponseHeaders(
+        response.responseHeaders,
+        null,
+        includeCredentials,
+      );
+      const text = new TextDecoder().decode(responseToArrayBuffer(response));
+      const contentType = headers["content-type"] || "";
+
+      let parsedBody = text;
+      if (contentType.includes("application/json")) {
+        try {
+          parsedBody = JSON.parse(text);
+        } catch {} // Keep as text
+      }
+
+      return {
+        success: true,
+        response: {
+          statusCode: response.status,
+          headers,
+          finalUrl: response.finalUrl || url,
+          body: parsedBody,
+        },
+      };
+    },
+
+    async prepareStream(body) {
+      if (!body) throw new Error("Missing request body");
+
+      const responseHeaders = {};
+      if (body.responseHeaders) {
+        for (const [key, value] of Object.entries(body.responseHeaders)) {
+          const normalizedKey = key.toLowerCase();
+          if (MODIFIABLE_HEADERS.has(normalizedKey)) {
+            responseHeaders[normalizedKey] = value;
+          }
+        }
+      }
+
+      proxyRules.set(body.ruleId, { ...body, responseHeaders });
+      installProxies();
+
+      return { success: true };
+    },
+
+    openPage(body) {
+      if (body?.redirectUrl) {
+        globalContext.location.href = body.redirectUrl;
+      }
+      return { success: true };
+    },
   };
 
-  const handleOpenPage = async (reqBody) => {
-    if (reqBody?.redirectUrl) {
-      window.location.href = reqBody.redirectUrl;
-    }
-    return { success: true };
-  };
+  function setupMessageRelay(messageName, handler) {
+    globalContext.addEventListener("message", async (event) => {
+      if (
+        event.source !== globalContext ||
+        event.data?.name !== messageName ||
+        event.data?.relayed
+      ) {
+        return;
+      }
 
-  // --- Messaging bridge --------------------------------------------------
-  const shouldHandleMessage = (event, config) => {
-    if (config.__internal) return false;
-    if (event.source !== pageWindow) return false;
-    if (event.data?.name !== config.name) return false;
-    if (config.relayId !== undefined && event.data?.relayId !== config.relayId) return false;
-    return true;
-  };
-
-  const relay = (config, handler) => {
-    const listener = async (event) => {
-      if (!shouldHandleMessage(event, config)) return;
-      if (event.data?.relayed) return;
+      const { instanceId, body } = event.data;
 
       try {
-        const result = await handler?.(event.data?.body);
-        pageWindow.postMessage(
-          {
-            name: config.name,
-            relayId: config.relayId,
-            instanceId: event.data?.instanceId,
-            body: result,
-            relayed: true,
-          },
-          config.targetOrigin || '/',
+        const result = await handler(body);
+        globalContext.postMessage(
+          { name: messageName, instanceId, body: result, relayed: true },
+          "/",
         );
-      } catch (err) {
-        pageWindow.postMessage(
+      } catch (error) {
+        logError(`${messageName} handler failed:`, error.message);
+        globalContext.postMessage(
           {
-            name: config.name,
-            relayId: config.relayId,
-            instanceId: event.data?.instanceId,
-            body: {
-              success: false,
-              error: err instanceof Error ? err.message : String(err),
-            },
+            name: messageName,
+            instanceId,
+            body: { success: false, error: error.message || String(error) },
             relayed: true,
           },
-          config.targetOrigin || '/',
+          "/",
         );
       }
-    };
+    });
+  }
 
-    pageWindow.addEventListener('message', listener);
-    return () => pageWindow.removeEventListener('message', listener);
-  };
-
-  relay({ name: 'hello' }, handleHello);
-  relay({ name: 'makeRequest' }, handleMakeRequest);
-  relay({ name: 'prepareStream' }, handlePrepareStream);
-  relay({ name: 'openPage' }, handleOpenPage);
-
-  log('Userscript proxy loaded');
+  for (const [name, handler] of Object.entries(messageHandlers)) {
+    setupMessageRelay(name, handler);
+  }
 })();
