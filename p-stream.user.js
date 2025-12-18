@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         P-Stream (GrokNT Fork)
 // @namespace    https://pstream.mov/
-// @version      1.4.2
+// @version      1.4.3
 // @description  P-Stream compatible UserScript
 // @author       Duplicake, P-Stream Team, groknt
 // @icon         https://raw.githubusercontent.com/p-stream/p-stream/production/public/mstile-150x150.jpeg
@@ -19,7 +19,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.4.2";
+  const VERSION = "1.4.3";
   const LOG_PREFIX = "P-Stream:";
 
   const CORS_HEADERS = Object.freeze({
@@ -81,6 +81,7 @@
   const proxyRules = new Map();
   const blobUrlRegistry = new Set();
   const proxyCache = new Map();
+  const regexCache = new Map();
   const patchStatus = { fetch: false, xhr: false, media: false };
 
   function logWarning(...args) {
@@ -95,6 +96,15 @@
     if (!input) return null;
     try {
       return new URL(input, base).href;
+    } catch {
+      return null;
+    }
+  }
+
+  function parseUrl(input, base = globalContext.location.href) {
+    if (!input) return null;
+    try {
+      return new URL(input, base);
     } catch {
       return null;
     }
@@ -134,6 +144,8 @@
       if (separatorIndex === -1) continue;
 
       const key = line.slice(0, separatorIndex).trim().toLowerCase();
+      if (!key) continue;
+
       const value = line.slice(separatorIndex + 1).trim();
       headers[key] = headers[key] ? `${headers[key]}, ${value}` : value;
     }
@@ -228,11 +240,26 @@
       : new TextEncoder().encode(response.responseText || "");
   }
 
-  function findMatchingRule(url) {
-    const normalizedUrl = normalizeUrl(url);
-    if (!normalizedUrl) return null;
+  function getCompiledRegex(pattern) {
+    if (regexCache.has(pattern)) {
+      return regexCache.get(pattern);
+    }
+    try {
+      const regex = new RegExp(pattern);
+      regexCache.set(pattern, regex);
+      return regex;
+    } catch {
+      regexCache.set(pattern, null);
+      return null;
+    }
+  }
 
-    const hostname = new URL(normalizedUrl).hostname;
+  function findMatchingRule(url) {
+    const parsedUrl = parseUrl(url);
+    if (!parsedUrl) return null;
+
+    const normalizedUrl = parsedUrl.href;
+    const hostname = parsedUrl.hostname;
 
     for (const rule of proxyRules.values()) {
       if (rule.targetDomains?.length) {
@@ -243,11 +270,8 @@
       }
 
       if (rule.targetRegex) {
-        try {
-          if (new RegExp(rule.targetRegex).test(normalizedUrl)) return rule;
-        } catch (error) {
-          logWarning("Invalid rule regex:", error.message);
-        }
+        const regex = getCompiledRegex(rule.targetRegex);
+        if (regex && regex.test(normalizedUrl)) return rule;
       }
     }
 
@@ -275,6 +299,13 @@
     }
     blobUrlRegistry.clear();
     proxyCache.clear();
+  }
+
+  function removeRuleCachedRegex(ruleId) {
+    const existingRule = proxyRules.get(ruleId);
+    if (existingRule?.targetRegex) {
+      regexCache.delete(existingRule.targetRegex);
+    }
   }
 
   function proxyMediaSource(url) {
@@ -396,6 +427,15 @@
         this.withCredentials = false;
         this.timeout = 0;
         this.upload = this._nativeXhr.upload;
+
+        this.onreadystatechange = null;
+        this.onload = null;
+        this.onerror = null;
+        this.ontimeout = null;
+        this.onabort = null;
+        this.onloadend = null;
+        this.onprogress = null;
+        this.onloadstart = null;
       }
 
       _emitEvent(eventType, event = new Event(eventType)) {
@@ -481,6 +521,21 @@
             break;
           }
 
+          case "document": {
+            const text = new TextDecoder().decode(buffer);
+            this.responseText = text;
+            try {
+              const parser = new DOMParser();
+              const mimeType = contentType.includes("xml")
+                ? "application/xml"
+                : "text/html";
+              this.response = parser.parseFromString(text, mimeType);
+            } catch {
+              this.response = null;
+            }
+            break;
+          }
+
           default: {
             const text = new TextDecoder().decode(buffer);
             this.response = text;
@@ -510,6 +565,14 @@
         if (this._useNative) {
           this._nativeXhr.removeEventListener(eventType, callback);
         }
+      }
+
+      dispatchEvent(event) {
+        if (this._useNative) {
+          return this._nativeXhr.dispatchEvent(event);
+        }
+        this._emitEvent(event.type, event);
+        return !event.defaultPrevented;
       }
 
       open(method, url, async = true, username, password) {
@@ -704,11 +767,13 @@
 
           originalSetter.call(element, value);
 
-          proxyMediaSource(value).then((proxiedUrl) => {
-            if (proxiedUrl && element.src === normalizedValue) {
-              originalSetter.call(element, proxiedUrl);
-            }
-          });
+          proxyMediaSource(value)
+            .then((proxiedUrl) => {
+              if (proxiedUrl && element.src === normalizedValue) {
+                originalSetter.call(element, proxiedUrl);
+              }
+            })
+            .catch(() => {});
         },
       });
     }
@@ -727,11 +792,13 @@
 
       nativeSetAttribute.call(element, "src", value);
 
-      proxyMediaSource(value).then((proxiedUrl) => {
-        if (proxiedUrl && element.src === normalizedValue) {
-          nativeSetAttribute.call(element, "src", proxiedUrl);
-        }
-      });
+      proxyMediaSource(value)
+        .then((proxiedUrl) => {
+          if (proxiedUrl && element.src === normalizedValue) {
+            nativeSetAttribute.call(element, "src", proxiedUrl);
+          }
+        })
+        .catch(() => {});
     };
 
     globalContext.addEventListener("beforeunload", () => {
@@ -807,6 +874,7 @@
       if (!body) throw new Error("Missing request body");
 
       cleanupStreamData();
+      removeRuleCachedRegex(body.ruleId);
 
       const responseHeaders = {};
       if (body.responseHeaders) {
