@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         P-Stream (GrokNT Fork)
 // @namespace    https://pstream.mov/
-// @version      1.4.1
+// @version      1.4.2
 // @description  P-Stream compatible UserScript
 // @author       Duplicake, P-Stream Team, groknt
 // @icon         https://raw.githubusercontent.com/p-stream/p-stream/production/public/mstile-150x150.jpeg
 // @match        *://pstream.mov/*
 // @match        *://aether.mom/*
+// @match        *://lordflix.club/*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @run-at       document-start
@@ -18,7 +19,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.4.1";
+  const VERSION = "1.4.2";
   const LOG_PREFIX = "P-Stream:";
 
   const CORS_HEADERS = Object.freeze({
@@ -695,10 +696,16 @@
             return;
           }
 
+          const normalizedValue = normalizeUrl(value);
+          if (!normalizedValue) {
+            originalSetter.call(element, value);
+            return;
+          }
+
           originalSetter.call(element, value);
 
           proxyMediaSource(value).then((proxiedUrl) => {
-            if (proxiedUrl && element.src === value) {
+            if (proxiedUrl && element.src === normalizedValue) {
               originalSetter.call(element, proxiedUrl);
             }
           });
@@ -713,10 +720,15 @@
         return nativeSetAttribute.call(element, name, value);
       }
 
+      const normalizedValue = normalizeUrl(value);
+      if (!normalizedValue) {
+        return nativeSetAttribute.call(element, "src", value);
+      }
+
       nativeSetAttribute.call(element, "src", value);
 
       proxyMediaSource(value).then((proxiedUrl) => {
-        if (proxiedUrl && element.getAttribute("src") === value) {
+        if (proxiedUrl && element.src === normalizedValue) {
           nativeSetAttribute.call(element, "src", proxiedUrl);
         }
       });
