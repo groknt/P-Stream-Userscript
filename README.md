@@ -1,3 +1,14 @@
+# Fork abandoned
+
+> [!CAUTION]
+> This userscript may eventually become outdated and/or cease to function.
+
+> [!NOTE]
+> The reason for abandoning this userscript is quite simple, really. I have transformed my entertainment setup from one based around P-Stream along with the associated 'FED API' to one which utilises Stremio with AIOStreams, many embedded addons and customisations, and most importantly, Real-Debrid.
+
+> [!NOTE]
+> **TL;DR:** I do not use P-Stream or its ecosystem anymore.
+
 # Userscript
 Userscript replacement for the P-Stream extension
 
