@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         P-Stream (GrokNT Fork)
 // @namespace    https://pstream.mov/
-// @version      1.4.3
+// @version      1.4.4
 // @description  P-Stream Userscript
 // @author       Duplicake, P-Stream Team, groknt
 // @icon         https://raw.githubusercontent.com/p-stream/p-stream/production/public/mstile-150x150.jpeg
@@ -838,7 +838,7 @@
       const url = buildUrl(body.url, body);
       const parsedUrl = parseUrl(url);
 
-      if (parsedUrl && isBlacklisted(parsedUrl.hostname)) {
+      if (parsedUrl && isBlacklistedHost(parsedUrl.hostname)) {
         throw new Error(
           `Request blocked: ${parsedUrl.hostname} is blacklisted`,
         );
