@@ -22,6 +22,8 @@
   const VERSION = "1.4.3";
   const LOG_PREFIX = "P-Stream:";
 
+  const BLACKLISTED_SOURCES = new Set(["fsharetv.co", "lmscript.xyz"]);
+
   const CORS_HEADERS = Object.freeze({
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
@@ -116,6 +118,10 @@
     } catch {
       return false;
     }
+  }
+
+  function isBlacklistedHost(hostname) {
+    return BLACKLISTED_SOURCES.has(hostname);
   }
 
   function buildUrl(url, options = {}) {
@@ -260,6 +266,7 @@
 
     const normalizedUrl = parsedUrl.href;
     const hostname = parsedUrl.hostname;
+    if (isBlacklistedHost(hostname)) return null;
 
     for (const rule of proxyRules.values()) {
       if (rule.targetDomains?.length) {
@@ -829,6 +836,14 @@
       if (!body) throw new Error("Missing request body");
 
       const url = buildUrl(body.url, body);
+      const parsedUrl = parseUrl(url);
+
+      if (parsedUrl && isBlacklisted(parsedUrl.hostname)) {
+        throw new Error(
+          `Request blocked: ${parsedUrl.hostname} is blacklisted`,
+        );
+      }
+
       const includeCredentials = shouldIncludeCredentials(
         url,
         body.credentials,
