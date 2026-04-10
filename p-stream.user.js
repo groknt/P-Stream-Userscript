@@ -1,13 +1,12 @@
 // ==UserScript==
-// @name         P-Stream (GrokNT Fork)
-// @namespace    https://pstream.mov/
-// @version      1.4.5
-// @description  P-Stream Userscript
-// @author       Duplicake, P-Stream Team, groknt
-// @icon         https://raw.githubusercontent.com/p-stream/p-stream/production/public/mstile-150x150.jpeg
-// @match        *://pstream.mov/*
+// @name         P-Stream Userscript
+// @namespace    https://pstream.net/
+// @version      1.5.0
+// @description  A P-Stream compatible userscript
+// @author       groknt
+// @license      MIT
+// @match        *://pstream.net/*
 // @match        *://aether.mom/*
-// @match        *://lordflix.club/*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @run-at       document-start
@@ -19,7 +18,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.4.3";
+  const VERSION = "1.5.0";
   const LOG_PREFIX = "P-Stream:";
 
   const CORS_HEADERS = Object.freeze({
@@ -37,7 +36,7 @@
     "content-disposition",
   ]);
 
-  const STREAMING_EXTENSIONS_REGEX = /\.(m3u8|mpd)(?:\?|$)/i;
+  const STREAMING_EXTENSIONS_RE = /\.(m3u8|mpd)(?:\?|$)/i;
   const STREAMING_MIME_TYPES = ["mpegurl", "dash+xml"];
 
   const XHR_STATES = Object.freeze({
@@ -48,8 +47,18 @@
     DONE: 4,
   });
 
-  const XHR_EVENT_TYPES = Object.freeze([
+  const XHR_EVENT_TYPES = [
     "readystatechange",
+    "load",
+    "error",
+    "timeout",
+    "abort",
+    "loadend",
+    "progress",
+    "loadstart",
+  ];
+
+  const PROGRESS_EVENT_TYPES = new Set([
     "load",
     "error",
     "timeout",
@@ -69,7 +78,14 @@
         ? GM.xmlHttpRequest
         : null;
 
-  const pageOrigin = (function () {
+  if (!gmXmlHttpRequest) {
+    console.warn(
+      LOG_PREFIX,
+      "GM_xmlhttpRequest unavailable — proxy requests will fail",
+    );
+  }
+
+  const pageOrigin = (() => {
     try {
       const { origin, href } = globalContext.location;
       return origin !== "null" ? origin : new URL(href).origin;
@@ -84,27 +100,22 @@
   const regexCache = new Map();
   const patchStatus = { fetch: false, xhr: false, media: false };
 
-  function logWarning(...args) {
-    console.warn(LOG_PREFIX, ...args);
-  }
+  const textDecoder = new TextDecoder();
+  const textEncoder = new TextEncoder();
 
-  function logError(...args) {
-    console.error(LOG_PREFIX, ...args);
-  }
-
-  function normalizeUrl(input, base = globalContext.location.href) {
+  function normalizeUrl(input, base) {
     if (!input) return null;
     try {
-      return new URL(input, base).href;
+      return new URL(input, base || globalContext.location.href).href;
     } catch {
       return null;
     }
   }
 
-  function parseUrl(input, base = globalContext.location.href) {
+  function parseUrl(input) {
     if (!input) return null;
     try {
-      return new URL(input, base);
+      return new URL(input, globalContext.location.href);
     } catch {
       return null;
     }
@@ -119,65 +130,80 @@
   }
 
   function buildUrl(url, options = {}) {
-    const { baseUrl = "", query = {} } = options;
-    const base = baseUrl.endsWith("/") ? baseUrl : baseUrl && `${baseUrl}/`;
-    const path = url.startsWith("/") ? url.slice(1) : url;
-    const fullUrl = `${base}${path}`;
+    const { baseUrl, query } = options;
+
+    let fullUrl;
+    if (/^https?:\/\//i.test(url)) {
+      fullUrl = url;
+    } else if (baseUrl) {
+      const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+      const path = url.startsWith("/") ? url.slice(1) : url;
+      fullUrl = `${base}${path}`;
+    } else {
+      fullUrl = url;
+    }
 
     if (!/^https?:\/\//i.test(fullUrl)) {
       throw new Error(`Invalid URL scheme: ${fullUrl}`);
     }
 
-    const parsedUrl = new URL(fullUrl);
-    for (const [key, value] of Object.entries(query)) {
-      parsedUrl.searchParams.set(key, value);
+    if (!query || Object.keys(query).length === 0) return fullUrl;
+
+    const parsed = new URL(fullUrl);
+    for (const key in query) {
+      parsed.searchParams.set(key, query[key]);
     }
-    return parsedUrl.href;
+    return parsed.href;
   }
 
-  function parseResponseHeaders(rawHeaders) {
-    const headers = {};
-    if (!rawHeaders) return headers;
+  function parseResponseHeaders(raw) {
+    const headers = Object.create(null);
+    if (!raw) return headers;
 
-    for (const line of rawHeaders.split(/\r?\n/)) {
-      const separatorIndex = line.indexOf(":");
-      if (separatorIndex === -1) continue;
+    const lines = raw.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const idx = line.indexOf(":");
+      if (idx === -1) continue;
 
-      const key = line.slice(0, separatorIndex).trim().toLowerCase();
+      const key = line.slice(0, idx).trim().toLowerCase();
       if (!key) continue;
 
-      const value = line.slice(separatorIndex + 1).trim();
-      headers[key] = headers[key] ? `${headers[key]}, ${value}` : value;
+      const value = line.slice(idx + 1).trim();
+      const existing = headers[key];
+      headers[key] = existing ? `${existing}, ${value}` : value;
     }
     return headers;
   }
 
-  function buildResponseHeaders(rawHeaders, ruleHeaders, includeCredentials) {
-    const headers = {
-      ...CORS_HEADERS,
-      ...ruleHeaders,
-      ...parseResponseHeaders(rawHeaders),
-    };
+  function buildResponseHeaders(raw, ruleHeaders, includeCredentials) {
+    const parsed = parseResponseHeaders(raw);
 
-    if (includeCredentials) {
-      headers["access-control-allow-credentials"] = "true";
-      if (
-        !headers["access-control-allow-origin"] ||
-        headers["access-control-allow-origin"] === "*"
-      ) {
-        headers["access-control-allow-origin"] = pageOrigin;
+    for (const key of MODIFIABLE_HEADERS) {
+      delete parsed[key];
+    }
+
+    if (ruleHeaders) {
+      for (const key in ruleHeaders) {
+        parsed[key] = ruleHeaders[key];
       }
     }
 
-    return headers;
+    parsed["access-control-allow-origin"] =
+      includeCredentials ? pageOrigin : "*";
+    parsed["access-control-allow-methods"] =
+      "GET, POST, PUT, DELETE, PATCH, OPTIONS";
+    parsed["access-control-allow-headers"] = "*";
+
+    if (includeCredentials) {
+      parsed["access-control-allow-credentials"] = "true";
+    }
+
+    return parsed;
   }
 
-  function shouldIncludeCredentials(
-    url,
-    credentialsMode,
-    forceInclude = false,
-  ) {
-    if (forceInclude || credentialsMode === "include") return true;
+  function shouldIncludeCredentials(url, credentialsMode, force) {
+    if (force || credentialsMode === "include") return true;
     if (credentialsMode === "omit") return false;
     return isSameOrigin(url);
   }
@@ -200,14 +226,13 @@
 
   function deserializeRequestBody(body, bodyType) {
     if (body == null) return undefined;
-
     switch (bodyType) {
       case "FormData": {
-        const formData = new FormData();
+        const fd = new FormData();
         for (const [key, value] of body) {
-          formData.append(key, value);
+          fd.append(key, value);
         }
-        return formData;
+        return fd;
       }
       case "URLSearchParams":
         return new URLSearchParams(body);
@@ -228,50 +253,56 @@
       gmXmlHttpRequest({
         ...options,
         onload: resolve,
-        onerror: (error) => reject(new Error(error?.error || "Network error")),
+        onerror: (err) =>
+          reject(new Error(err?.error || err?.message || "Network error")),
         ontimeout: () => reject(new Error("Request timeout")),
       });
     });
   }
 
   function responseToArrayBuffer(response) {
-    return response.response instanceof ArrayBuffer
-      ? response.response
-      : new TextEncoder().encode(response.responseText || "");
+    if (response.response instanceof ArrayBuffer) {
+      return response.response;
+    }
+    const encoded = textEncoder.encode(response.responseText || "");
+    return encoded.buffer.byteLength === encoded.byteLength
+      ? encoded.buffer
+      : encoded.buffer.slice(
+          encoded.byteOffset,
+          encoded.byteOffset + encoded.byteLength,
+        );
   }
 
   function getCompiledRegex(pattern) {
-    if (regexCache.has(pattern)) {
-      return regexCache.get(pattern);
-    }
+    let cached = regexCache.get(pattern);
+    if (cached !== undefined) return cached;
     try {
-      const regex = new RegExp(pattern);
-      regexCache.set(pattern, regex);
-      return regex;
+      cached = new RegExp(pattern);
     } catch {
-      regexCache.set(pattern, null);
-      return null;
+      cached = null;
     }
+    regexCache.set(pattern, cached);
+    return cached;
   }
 
   function findMatchingRule(url) {
-    const parsedUrl = parseUrl(url);
-    if (!parsedUrl) return null;
+    const parsed = parseUrl(url);
+    if (!parsed) return null;
 
-    const normalizedUrl = parsedUrl.href;
-    const hostname = parsedUrl.hostname;
+    const { href, hostname } = parsed;
 
     for (const rule of proxyRules.values()) {
-      if (rule.targetDomains?.length) {
-        const domainMatches = rule.targetDomains.some(
-          (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
-        );
-        if (domainMatches) return rule;
+      const domains = rule.targetDomains;
+      if (domains && domains.length > 0) {
+        for (let i = 0; i < domains.length; i++) {
+          const d = domains[i];
+          if (hostname === d || hostname.endsWith(`.${d}`)) return rule;
+        }
       }
 
       if (rule.targetRegex) {
         const regex = getCompiledRegex(rule.targetRegex);
-        if (regex && regex.test(normalizedUrl)) return rule;
+        if (regex && regex.test(href)) return rule;
       }
     }
 
@@ -279,50 +310,56 @@
   }
 
   function isStreamingContent(contentType, url) {
-    return (
-      STREAMING_MIME_TYPES.some((mimeType) => contentType.includes(mimeType)) ||
-      STREAMING_EXTENSIONS_REGEX.test(url)
-    );
+    if (STREAMING_EXTENSIONS_RE.test(url)) return true;
+    for (let i = 0; i < STREAMING_MIME_TYPES.length; i++) {
+      if (contentType.includes(STREAMING_MIME_TYPES[i])) return true;
+    }
+    return false;
   }
 
-  function createBlobUrl(data, contentType = "application/octet-stream") {
-    const url = URL.createObjectURL(new Blob([data], { type: contentType }));
+  function createBlobUrl(data, contentType) {
+    const url = URL.createObjectURL(
+      new Blob([data], { type: contentType || "application/octet-stream" }),
+    );
     blobUrlRegistry.add(url);
     return url;
   }
 
   function cleanupStreamData() {
-    for (const blobUrl of blobUrlRegistry) {
+    for (const url of blobUrlRegistry) {
       try {
-        URL.revokeObjectURL(blobUrl);
+        URL.revokeObjectURL(url);
       } catch {}
     }
     blobUrlRegistry.clear();
     proxyCache.clear();
   }
 
-  function removeRuleCachedRegex(ruleId) {
-    const existingRule = proxyRules.get(ruleId);
-    if (existingRule?.targetRegex) {
-      regexCache.delete(existingRule.targetRegex);
+  function createXhrEvent(type, loaded, total) {
+    if (PROGRESS_EVENT_TYPES.has(type)) {
+      return new ProgressEvent(type, {
+        lengthComputable: total > 0,
+        loaded: loaded || 0,
+        total: total || 0,
+      });
     }
+    return new Event(type);
   }
 
   function proxyMediaSource(url) {
-    const normalizedUrl = normalizeUrl(url);
-    if (!normalizedUrl) return Promise.resolve(null);
+    const normalized = normalizeUrl(url);
+    if (!normalized) return Promise.resolve(null);
 
-    const rule = findMatchingRule(normalizedUrl);
+    const rule = findMatchingRule(normalized);
     if (!rule) return Promise.resolve(null);
 
-    if (proxyCache.has(normalizedUrl)) {
-      return proxyCache.get(normalizedUrl);
-    }
+    const cached = proxyCache.get(normalized);
+    if (cached) return cached;
 
-    const proxyPromise = (async () => {
+    const promise = (async () => {
       try {
         const response = await executeGmRequest({
-          url: normalizedUrl,
+          url: normalized,
           method: "GET",
           headers: rule.requestHeaders,
           responseType: "arraybuffer",
@@ -331,19 +368,19 @@
 
         const contentType =
           parseResponseHeaders(response.responseHeaders)["content-type"] || "";
-        if (isStreamingContent(contentType, normalizedUrl)) return null;
+        if (isStreamingContent(contentType, normalized)) return null;
 
         return createBlobUrl(responseToArrayBuffer(response), contentType);
-      } catch (error) {
-        logWarning("Media proxy failed:", error.message);
+      } catch (err) {
+        console.warn(LOG_PREFIX, "Media proxy failed:", err.message);
         return null;
       } finally {
-        setTimeout(() => proxyCache.delete(normalizedUrl), 1000);
+        setTimeout(() => proxyCache.delete(normalized), 1000);
       }
     })();
 
-    proxyCache.set(normalizedUrl, proxyPromise);
-    return proxyPromise;
+    proxyCache.set(normalized, promise);
+    return promise;
   }
 
   function patchFetch() {
@@ -355,7 +392,6 @@
     globalContext.fetch = async function (input, init = {}) {
       const url = normalizeUrl(typeof input === "string" ? input : input?.url);
       const rule = url && findMatchingRule(url);
-
       if (!rule) return nativeFetch(input, init);
 
       const headers = {
@@ -364,11 +400,7 @@
           ? Object.fromEntries(init.headers)
           : init.headers),
       };
-
-      const includeCredentials = shouldIncludeCredentials(
-        url,
-        init.credentials,
-      );
+      const includeCreds = shouldIncludeCredentials(url, init.credentials);
 
       try {
         const response = await executeGmRequest({
@@ -377,7 +409,7 @@
           headers,
           data: normalizeRequestBody(init.body),
           responseType: "arraybuffer",
-          withCredentials: includeCredentials,
+          withCredentials: includeCreds,
         });
 
         return new Response(responseToArrayBuffer(response), {
@@ -386,11 +418,11 @@
           headers: buildResponseHeaders(
             response.responseHeaders,
             rule.responseHeaders,
-            includeCredentials,
+            includeCreds,
           ),
         });
-      } catch (error) {
-        logWarning("Fetch proxy failed:", error.message);
+      } catch (err) {
+        console.warn(LOG_PREFIX, "Fetch proxy failed:", err.message);
         return nativeFetch(input, init);
       }
     };
@@ -400,24 +432,24 @@
     if (patchStatus.xhr) return;
     patchStatus.xhr = true;
 
-    const NativeXMLHttpRequest = globalContext.XMLHttpRequest;
+    const NativeXHR = globalContext.XMLHttpRequest;
 
     class ProxyXMLHttpRequest {
       constructor() {
-        this._nativeXhr = new NativeXMLHttpRequest();
+        this._native = new NativeXHR();
         this._useNative = true;
-        this._eventListeners = new Map();
-        this._requestHeaders = {};
-        this._responseHeaders = {};
-        this._matchedRule = null;
-        this._requestUrl = "";
-        this._requestMethod = "GET";
-        this._isAborted = false;
+        this._listeners = new Map();
+        this._reqHeaders = {};
+        this._resHeaders = null;
+        this._rule = null;
+        this._url = "";
+        this._method = "GET";
+        this._aborted = false;
         this._timeoutId = null;
-        this._overriddenMimeType = "";
-        this._nativeEventsBound = false;
+        this._mimeOverride = "";
+        this._nativeBound = false;
 
-        this.readyState = XHR_STATES.UNSENT;
+        this.readyState = 0;
         this.status = 0;
         this.statusText = "";
         this.response = null;
@@ -426,7 +458,7 @@
         this.responseType = "";
         this.withCredentials = false;
         this.timeout = 0;
-        this.upload = this._nativeXhr.upload;
+        this.upload = this._native.upload;
 
         this.onreadystatechange = null;
         this.onload = null;
@@ -438,67 +470,70 @@
         this.onloadstart = null;
       }
 
-      _emitEvent(eventType, event = new Event(eventType)) {
-        const handler = this[`on${eventType}`];
+      _emit(type, event) {
+        if (!event) event = createXhrEvent(type);
+
+        const handler = this[`on${type}`];
         if (handler) {
           try {
             handler.call(this, event);
-          } catch (error) {
-            logError("XHR handler error:", error);
+          } catch (e) {
+            console.error(LOG_PREFIX, "XHR handler error:", e);
           }
         }
 
-        const listeners = this._eventListeners.get(eventType);
-        if (listeners) {
-          for (const listener of listeners) {
+        const list = this._listeners.get(type);
+        if (list && list.length > 0) {
+          const snapshot = list.slice();
+          for (let i = 0; i < snapshot.length; i++) {
             try {
-              listener.call(this, event);
-            } catch (error) {
-              logError("XHR listener error:", error);
+              snapshot[i].call(this, event);
+            } catch (e) {
+              console.error(LOG_PREFIX, "XHR listener error:", e);
             }
           }
         }
       }
 
-      _syncFromNative() {
+      _syncNative() {
         if (!this._useNative) return;
-
         try {
-          this.readyState = this._nativeXhr.readyState;
-
-          if (this.readyState >= XHR_STATES.HEADERS_RECEIVED) {
-            this.status = this._nativeXhr.status;
-            this.statusText = this._nativeXhr.statusText;
+          this.readyState = this._native.readyState;
+          if (this.readyState >= 2) {
+            this.status = this._native.status;
+            this.statusText = this._native.statusText;
           }
-
-          if (this.readyState === XHR_STATES.DONE) {
-            this.response = this._nativeXhr.response;
-            this.responseURL = this._nativeXhr.responseURL;
-
-            const responseType = this._nativeXhr.responseType;
-            if (!responseType || responseType === "text") {
-              this.responseText = this._nativeXhr.responseText;
+          if (this.readyState >= 3) {
+            this.response = this._native.response;
+          }
+          if (this.readyState === 4) {
+            this.responseURL = this._native.responseURL;
+            const rt = this._native.responseType;
+            if (!rt || rt === "text") {
+              this.responseText = this._native.responseText;
             }
           }
         } catch {}
       }
 
-      _bindNativeEvents() {
-        if (this._nativeEventsBound) return;
-        this._nativeEventsBound = true;
+      _bindNative() {
+        if (this._nativeBound) return;
+        this._nativeBound = true;
 
-        for (const eventType of XHR_EVENT_TYPES) {
-          this._nativeXhr.addEventListener(eventType, (event) => {
-            this._syncFromNative();
-            this._emitEvent(eventType, event);
+        const self = this;
+        for (let i = 0; i < XHR_EVENT_TYPES.length; i++) {
+          const type = XHR_EVENT_TYPES[i];
+          this._native.addEventListener(type, function (event) {
+            self._syncNative();
+            self._emit(type, event);
           });
         }
       }
 
-      _setResponseData(buffer) {
+      _applyResponse(buffer) {
         const contentType =
           this.getResponseHeader("content-type") ||
-          this._overriddenMimeType ||
+          this._mimeOverride ||
           "application/octet-stream";
 
         switch (this.responseType) {
@@ -511,7 +546,7 @@
             break;
 
           case "json": {
-            const text = new TextDecoder().decode(buffer);
+            const text = textDecoder.decode(buffer);
             this.responseText = text;
             try {
               this.response = JSON.parse(text);
@@ -522,14 +557,13 @@
           }
 
           case "document": {
-            const text = new TextDecoder().decode(buffer);
+            const text = textDecoder.decode(buffer);
             this.responseText = text;
             try {
-              const parser = new DOMParser();
-              const mimeType = contentType.includes("xml")
+              const mime = contentType.includes("xml")
                 ? "application/xml"
                 : "text/html";
-              this.response = parser.parseFromString(text, mimeType);
+              this.response = new DOMParser().parseFromString(text, mime);
             } catch {
               this.response = null;
             }
@@ -537,91 +571,100 @@
           }
 
           default: {
-            const text = new TextDecoder().decode(buffer);
+            const text = textDecoder.decode(buffer);
             this.response = text;
             this.responseText = text;
           }
         }
       }
 
-      addEventListener(eventType, callback) {
-        if (!this._eventListeners.has(eventType)) {
-          this._eventListeners.set(eventType, []);
+      addEventListener(type, callback) {
+        let list = this._listeners.get(type);
+        if (!list) {
+          list = [];
+          this._listeners.set(type, []);
         }
-        this._eventListeners.get(eventType).push(callback);
-
-        if (this._useNative) {
-          this._nativeXhr.addEventListener(eventType, callback);
-        }
+        this._listeners.get(type).push(callback);
       }
 
-      removeEventListener(eventType, callback) {
-        const listeners = this._eventListeners.get(eventType);
-        if (listeners) {
-          const index = listeners.indexOf(callback);
-          if (index !== -1) listeners.splice(index, 1);
-        }
-
-        if (this._useNative) {
-          this._nativeXhr.removeEventListener(eventType, callback);
-        }
+      removeEventListener(type, callback) {
+        const list = this._listeners.get(type);
+        if (!list) return;
+        const idx = list.indexOf(callback);
+        if (idx !== -1) list.splice(idx, 1);
       }
 
       dispatchEvent(event) {
-        if (this._useNative) {
-          return this._nativeXhr.dispatchEvent(event);
+        if (this._useNative && this._nativeBound) {
+          return this._native.dispatchEvent(event);
         }
-        this._emitEvent(event.type, event);
+        this._emit(event.type, event);
         return !event.defaultPrevented;
       }
 
-      open(method, url, async = true, username, password) {
-        this._requestMethod = method;
-        this._requestUrl = normalizeUrl(url) || url;
-        this._matchedRule = findMatchingRule(this._requestUrl);
-        this._useNative = !this._matchedRule;
+      open(method, url, async, username, password) {
+        this._method = method;
+        this._url = normalizeUrl(url) || url;
+        this._rule = findMatchingRule(this._url);
+        this._useNative = !this._rule;
+        this._aborted = false;
+        this._reqHeaders = {};
 
         if (this._useNative) {
-          return this._nativeXhr.open(method, url, async, username, password);
+          this._native.open(
+            method,
+            url,
+            async !== undefined ? async : true,
+            username,
+            password,
+          );
+          this.readyState = this._native.readyState;
+          return;
         }
 
-        this.readyState = XHR_STATES.OPENED;
-        this._emitEvent("readystatechange");
+        this.readyState = 1;
+        this._emit("readystatechange");
       }
 
       setRequestHeader(name, value) {
         if (this._useNative) {
-          return this._nativeXhr.setRequestHeader(name, value);
+          return this._native.setRequestHeader(name, value);
         }
-        this._requestHeaders[name] = value;
+        this._reqHeaders[name] = value;
       }
 
       getResponseHeader(name) {
         if (this._useNative) {
-          return this._nativeXhr.getResponseHeader(name);
+          return this._native.getResponseHeader(name);
         }
-        return this._responseHeaders[name?.toLowerCase()] ?? null;
+        if (!this._resHeaders) return null;
+        return this._resHeaders[name?.toLowerCase()] ?? null;
       }
 
       getAllResponseHeaders() {
         if (this._useNative) {
-          return this._nativeXhr.getAllResponseHeaders();
+          return this._native.getAllResponseHeaders();
         }
-        return Object.entries(this._responseHeaders)
-          .map(([key, value]) => `${key}: ${value}`)
-          .join("\r\n");
+        if (!this._resHeaders) return "";
+        const h = this._resHeaders;
+        const keys = Object.keys(h);
+        const parts = new Array(keys.length);
+        for (let i = 0; i < keys.length; i++) {
+          parts[i] = `${keys[i]}: ${h[keys[i]]}`;
+        }
+        return parts.join("\r\n");
       }
 
-      overrideMimeType(mimeType) {
+      overrideMimeType(mime) {
         if (this._useNative) {
-          return this._nativeXhr.overrideMimeType(mimeType);
+          return this._native.overrideMimeType(mime);
         }
-        this._overriddenMimeType = mimeType;
+        this._mimeOverride = mime;
       }
 
       abort() {
         if (this._useNative) {
-          return this._nativeXhr.abort();
+          return this._native.abort();
         }
 
         if (this._timeoutId) {
@@ -629,43 +672,40 @@
           this._timeoutId = null;
         }
 
-        this._isAborted = true;
-        this.readyState = XHR_STATES.UNSENT;
-        this._emitEvent("abort");
+        this._aborted = true;
+        this.readyState = 0;
+        this._emit("abort");
       }
 
-      async send(body = null) {
+      async send(body) {
         if (this._useNative) {
-          this._nativeXhr.withCredentials = this.withCredentials;
-          this._nativeXhr.responseType = this.responseType;
-          this._nativeXhr.timeout = this.timeout;
-          this._bindNativeEvents();
-          return this._nativeXhr.send(body);
+          this._native.withCredentials = this.withCredentials;
+          this._native.responseType = this.responseType;
+          this._native.timeout = this.timeout;
+          this._bindNative();
+          return this._native.send(body === undefined ? null : body);
         }
 
-        const rule = this._matchedRule;
-        const url = this._requestUrl;
-        const method = this._requestMethod;
-
-        const headers = { ...rule.requestHeaders, ...this._requestHeaders };
-        const includeCredentials = shouldIncludeCredentials(
+        const { _rule: rule, _url: url, _method: method } = this;
+        const headers = { ...rule.requestHeaders, ...this._reqHeaders };
+        const includeCreds = shouldIncludeCredentials(
           url,
           this.withCredentials ? "include" : undefined,
           this.withCredentials,
         );
-        const binaryResponse =
+        const wantBinary =
           this.responseType === "arraybuffer" || this.responseType === "blob";
 
-        const requestPromise = executeGmRequest({
+        const reqPromise = executeGmRequest({
           url,
           method,
           headers,
-          data: normalizeRequestBody(body),
-          responseType: binaryResponse ? "arraybuffer" : "text",
-          withCredentials: includeCredentials,
+          data: normalizeRequestBody(body === undefined ? null : body),
+          responseType: wantBinary ? "arraybuffer" : "text",
+          withCredentials: includeCreds,
         });
 
-        let timeoutPromise = null;
+        let timeoutPromise;
         if (this.timeout > 0) {
           timeoutPromise = new Promise((_, reject) => {
             this._timeoutId = setTimeout(
@@ -675,63 +715,65 @@
           });
         }
 
-        this._emitEvent("loadstart");
+        this._emit("loadstart");
 
         try {
           const response = await (timeoutPromise
-            ? Promise.race([requestPromise, timeoutPromise])
-            : requestPromise);
+            ? Promise.race([reqPromise, timeoutPromise])
+            : reqPromise);
 
           if (this._timeoutId) {
             clearTimeout(this._timeoutId);
             this._timeoutId = null;
           }
+          if (this._aborted) return;
 
-          if (this._isAborted) return;
-
-          this._responseHeaders = buildResponseHeaders(
+          this._resHeaders = buildResponseHeaders(
             response.responseHeaders,
             rule.responseHeaders,
-            includeCredentials,
+            includeCreds,
           );
           this.responseURL = response.finalUrl || url;
           this.status = response.status;
           this.statusText = response.statusText || "";
 
           const buffer = responseToArrayBuffer(response);
+          const size = buffer.byteLength;
 
-          this.readyState = XHR_STATES.HEADERS_RECEIVED;
-          this._emitEvent("readystatechange");
+          this.readyState = 2;
+          this._emit("readystatechange");
 
-          this.readyState = XHR_STATES.LOADING;
-          this._emitEvent("readystatechange");
+          this.readyState = 3;
+          this._emit("readystatechange");
+          this._emit("progress", createXhrEvent("progress", size, size));
 
-          this._setResponseData(buffer);
+          this._applyResponse(buffer);
 
-          this.readyState = XHR_STATES.DONE;
-          this._emitEvent("readystatechange");
-          this._emitEvent("load");
-          this._emitEvent("loadend");
-        } catch (error) {
+          this.readyState = 4;
+          this._emit("readystatechange");
+          this._emit("load", createXhrEvent("load", size, size));
+          this._emit("loadend", createXhrEvent("loadend", size, size));
+        } catch (err) {
           if (this._timeoutId) {
             clearTimeout(this._timeoutId);
             this._timeoutId = null;
           }
-
-          if (this._isAborted) return;
+          if (this._aborted) return;
 
           this.status = 0;
-          this.statusText = error.message || "";
-          this.readyState = XHR_STATES.DONE;
+          this.statusText = err.message || "";
+          this.readyState = 4;
 
-          this._emitEvent("readystatechange");
-          this._emitEvent(error.message === "timeout" ? "timeout" : "error");
-          this._emitEvent("loadend");
+          const type = err.message === "timeout" ? "timeout" : "error";
+          this._emit("readystatechange");
+          this._emit(type);
+          this._emit("loadend");
         }
       }
     }
 
     Object.assign(ProxyXMLHttpRequest, XHR_STATES);
+    Object.assign(ProxyXMLHttpRequest.prototype, XHR_STATES);
     globalContext.XMLHttpRequest = ProxyXMLHttpRequest;
   }
 
@@ -739,38 +781,34 @@
     if (patchStatus.media) return;
     patchStatus.media = true;
 
-    const mediaPrototype = globalContext.HTMLMediaElement.prototype;
-    const srcDescriptor = Object.getOwnPropertyDescriptor(
-      mediaPrototype,
-      "src",
-    );
-    const nativeSetAttribute = mediaPrototype.setAttribute;
+    const proto = globalContext.HTMLMediaElement.prototype;
+    const srcDesc = Object.getOwnPropertyDescriptor(proto, "src");
+    const nativeSetAttr = proto.setAttribute;
 
-    if (srcDescriptor?.set) {
-      const originalSetter = srcDescriptor.set;
+    if (srcDesc?.set) {
+      const originalSet = srcDesc.set;
 
-      Object.defineProperty(mediaPrototype, "src", {
-        ...srcDescriptor,
+      Object.defineProperty(proto, "src", {
+        ...srcDesc,
         set(value) {
-          const element = this;
-
           if (typeof value !== "string") {
-            originalSetter.call(element, value);
+            originalSet.call(this, value);
             return;
           }
 
-          const normalizedValue = normalizeUrl(value);
-          if (!normalizedValue) {
-            originalSetter.call(element, value);
+          const normalized = normalizeUrl(value);
+          if (!normalized) {
+            originalSet.call(this, value);
             return;
           }
 
-          originalSetter.call(element, value);
+          originalSet.call(this, value);
+          const el = this;
 
           proxyMediaSource(value)
-            .then((proxiedUrl) => {
-              if (proxiedUrl && element.src === normalizedValue) {
-                originalSetter.call(element, proxiedUrl);
+            .then((proxied) => {
+              if (proxied && el.src === normalized) {
+                originalSet.call(el, proxied);
               }
             })
             .catch(() => {});
@@ -778,35 +816,29 @@
       });
     }
 
-    mediaPrototype.setAttribute = function (name, value) {
-      const element = this;
-
+    proto.setAttribute = function (name, value) {
       if (name?.toLowerCase() !== "src" || typeof value !== "string") {
-        return nativeSetAttribute.call(element, name, value);
+        return nativeSetAttr.call(this, name, value);
       }
 
-      const normalizedValue = normalizeUrl(value);
-      if (!normalizedValue) {
-        return nativeSetAttribute.call(element, "src", value);
+      const normalized = normalizeUrl(value);
+      if (!normalized) {
+        return nativeSetAttr.call(this, "src", value);
       }
 
-      nativeSetAttribute.call(element, "src", value);
+      nativeSetAttr.call(this, "src", value);
+      const el = this;
 
       proxyMediaSource(value)
-        .then((proxiedUrl) => {
-          if (proxiedUrl && element.src === normalizedValue) {
-            nativeSetAttribute.call(element, "src", proxiedUrl);
+        .then((proxied) => {
+          if (proxied && el.src === normalized) {
+            nativeSetAttr.call(el, "src", proxied);
           }
         })
         .catch(() => {});
     };
 
-    globalContext.addEventListener("beforeunload", () => {
-      for (const url of blobUrlRegistry) {
-        URL.revokeObjectURL(url);
-      }
-      blobUrlRegistry.clear();
-    });
+    globalContext.addEventListener("beforeunload", cleanupStreamData);
   }
 
   function installProxies() {
@@ -829,7 +861,7 @@
       if (!body) throw new Error("Missing request body");
 
       const url = buildUrl(body.url, body);
-      const includeCredentials = shouldIncludeCredentials(
+      const includeCreds = shouldIncludeCredentials(
         url,
         body.credentials,
         body.withCredentials,
@@ -841,15 +873,15 @@
         headers: body.headers,
         data: deserializeRequestBody(body.body, body.bodyType),
         responseType: "arraybuffer",
-        withCredentials: includeCredentials,
+        withCredentials: includeCreds,
       });
 
       const headers = buildResponseHeaders(
         response.responseHeaders,
         null,
-        includeCredentials,
+        includeCreds,
       );
-      const text = new TextDecoder().decode(responseToArrayBuffer(response));
+      const text = textDecoder.decode(responseToArrayBuffer(response));
       const contentType = headers["content-type"] || "";
 
       let parsedBody = text;
@@ -874,14 +906,20 @@
       if (!body) throw new Error("Missing request body");
 
       cleanupStreamData();
-      removeRuleCachedRegex(body.ruleId);
+
+      const existing = proxyRules.get(body.ruleId);
+      if (existing?.targetRegex) {
+        regexCache.delete(existing.targetRegex);
+      }
 
       const responseHeaders = {};
       if (body.responseHeaders) {
-        for (const [key, value] of Object.entries(body.responseHeaders)) {
-          const normalizedKey = key.toLowerCase();
-          if (MODIFIABLE_HEADERS.has(normalizedKey)) {
-            responseHeaders[normalizedKey] = value;
+        const src = body.responseHeaders;
+        const keys = Object.keys(src);
+        for (let i = 0; i < keys.length; i++) {
+          const lower = keys[i].toLowerCase();
+          if (MODIFIABLE_HEADERS.has(lower)) {
+            responseHeaders[lower] = src[keys[i]];
           }
         }
       }
@@ -900,31 +938,32 @@
     },
   };
 
-  function setupMessageRelay(messageName, handler) {
+  function setupMessageRelay(name, handler) {
     globalContext.addEventListener("message", async (event) => {
+      const data = event.data;
       if (
         event.source !== globalContext ||
-        event.data?.name !== messageName ||
-        event.data?.relayed
+        data?.name !== name ||
+        data?.relayed
       ) {
         return;
       }
 
-      const { instanceId, body } = event.data;
+      const { instanceId, body } = data;
 
       try {
         const result = await handler(body);
         globalContext.postMessage(
-          { name: messageName, instanceId, body: result, relayed: true },
+          { name, instanceId, body: result, relayed: true },
           "/",
         );
-      } catch (error) {
-        logError(`${messageName} handler failed:`, error.message);
+      } catch (err) {
+        console.error(LOG_PREFIX, `${name} handler failed:`, err.message);
         globalContext.postMessage(
           {
-            name: messageName,
+            name,
             instanceId,
-            body: { success: false, error: error.message || String(error) },
+            body: { success: false, error: err.message || String(err) },
             relayed: true,
           },
           "/",
@@ -933,7 +972,9 @@
     });
   }
 
-  for (const [name, handler] of Object.entries(messageHandlers)) {
-    setupMessageRelay(name, handler);
+  const handlerNames = Object.keys(messageHandlers);
+  for (let i = 0; i < handlerNames.length; i++) {
+    const name = handlerNames[i];
+    setupMessageRelay(name, messageHandlers[name]);
   }
 })();
