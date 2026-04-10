@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         P-Stream Userscript
-// @namespace    https://pstream.net/
+// @namespace    groknt
 // @version      1.5.0
 // @description  A P-Stream compatible userscript
 // @author       groknt
