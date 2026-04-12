@@ -21,12 +21,6 @@
   const VERSION = "1.5.0";
   const LOG_PREFIX = "P-Stream:";
 
-  const CORS_HEADERS = Object.freeze({
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-    "access-control-allow-headers": "*",
-  });
-
   const MODIFIABLE_HEADERS = new Set([
     "access-control-allow-origin",
     "access-control-allow-methods",
@@ -103,19 +97,19 @@
   const textDecoder = new TextDecoder();
   const textEncoder = new TextEncoder();
 
-  function normalizeUrl(input, base) {
+  function parseUrl(input) {
     if (!input) return null;
     try {
-      return new URL(input, base || globalContext.location.href).href;
+      return new URL(input, globalContext.location.href);
     } catch {
       return null;
     }
   }
 
-  function parseUrl(input) {
+  function normalizeUrl(input, base) {
     if (!input) return null;
     try {
-      return new URL(input, globalContext.location.href);
+      return new URL(input, base || globalContext.location.href).href;
     } catch {
       return null;
     }
@@ -228,11 +222,11 @@
     if (body == null) return undefined;
     switch (bodyType) {
       case "FormData": {
-        const fd = new FormData();
+        const formData = new FormData();
         for (const [key, value] of body) {
-          fd.append(key, value);
+          formData.append(key, value);
         }
-        return fd;
+        return formData;
       }
       case "URLSearchParams":
         return new URLSearchParams(body);
@@ -295,8 +289,9 @@
       const domains = rule.targetDomains;
       if (domains && domains.length > 0) {
         for (let i = 0; i < domains.length; i++) {
-          const d = domains[i];
-          if (hostname === d || hostname.endsWith(`.${d}`)) return rule;
+          const domain = domains[i];
+          if (hostname === domain || hostname.endsWith(`.${domain}`))
+            return rule;
         }
       }
 
@@ -383,6 +378,19 @@
     return promise;
   }
 
+  function proxyMediaSrc(element, value, nativeSetter) {
+    const normalized = normalizeUrl(value);
+    if (!normalized) return;
+
+    proxyMediaSource(value)
+      .then((proxied) => {
+        if (proxied && element.src === normalized) {
+          nativeSetter.call(element, proxied);
+        }
+      })
+      .catch(() => {});
+  }
+
   function patchFetch() {
     if (patchStatus.fetch) return;
     patchStatus.fetch = true;
@@ -400,7 +408,10 @@
           ? Object.fromEntries(init.headers)
           : init.headers),
       };
-      const includeCreds = shouldIncludeCredentials(url, init.credentials);
+      const includeCredentials = shouldIncludeCredentials(
+        url,
+        init.credentials,
+      );
 
       try {
         const response = await executeGmRequest({
@@ -409,7 +420,7 @@
           headers,
           data: normalizeRequestBody(init.body),
           responseType: "arraybuffer",
-          withCredentials: includeCreds,
+          withCredentials: includeCredentials,
         });
 
         return new Response(responseToArrayBuffer(response), {
@@ -418,7 +429,7 @@
           headers: buildResponseHeaders(
             response.responseHeaders,
             rule.responseHeaders,
-            includeCreds,
+            includeCredentials,
           ),
         });
       } catch (err) {
@@ -477,8 +488,8 @@
         if (handler) {
           try {
             handler.call(this, event);
-          } catch (e) {
-            console.error(LOG_PREFIX, "XHR handler error:", e);
+          } catch (err) {
+            console.error(LOG_PREFIX, "XHR handler error:", err);
           }
         }
 
@@ -488,8 +499,8 @@
           for (let i = 0; i < snapshot.length; i++) {
             try {
               snapshot[i].call(this, event);
-            } catch (e) {
-              console.error(LOG_PREFIX, "XHR listener error:", e);
+            } catch (err) {
+              console.error(LOG_PREFIX, "XHR listener error:", err);
             }
           }
         }
@@ -508,8 +519,8 @@
           }
           if (this.readyState === 4) {
             this.responseURL = this._native.responseURL;
-            const rt = this._native.responseType;
-            if (!rt || rt === "text") {
+            const nativeResponseType = this._native.responseType;
+            if (!nativeResponseType || nativeResponseType === "text") {
               this.responseText = this._native.responseText;
             }
           }
@@ -582,9 +593,9 @@
         let list = this._listeners.get(type);
         if (!list) {
           list = [];
-          this._listeners.set(type, []);
+          this._listeners.set(type, list);
         }
-        this._listeners.get(type).push(callback);
+        list.push(callback);
       }
 
       removeEventListener(type, callback) {
@@ -646,11 +657,11 @@
           return this._native.getAllResponseHeaders();
         }
         if (!this._resHeaders) return "";
-        const h = this._resHeaders;
-        const keys = Object.keys(h);
+        const headers = this._resHeaders;
+        const keys = Object.keys(headers);
         const parts = new Array(keys.length);
         for (let i = 0; i < keys.length; i++) {
-          parts[i] = `${keys[i]}: ${h[keys[i]]}`;
+          parts[i] = `${keys[i]}: ${headers[keys[i]]}`;
         }
         return parts.join("\r\n");
       }
@@ -688,7 +699,7 @@
 
         const { _rule: rule, _url: url, _method: method } = this;
         const headers = { ...rule.requestHeaders, ...this._reqHeaders };
-        const includeCreds = shouldIncludeCredentials(
+        const includeCredentials = shouldIncludeCredentials(
           url,
           this.withCredentials ? "include" : undefined,
           this.withCredentials,
@@ -702,7 +713,7 @@
           headers,
           data: normalizeRequestBody(body === undefined ? null : body),
           responseType: wantBinary ? "arraybuffer" : "text",
-          withCredentials: includeCreds,
+          withCredentials: includeCredentials,
         });
 
         let timeoutPromise;
@@ -731,7 +742,7 @@
           this._resHeaders = buildResponseHeaders(
             response.responseHeaders,
             rule.responseHeaders,
-            includeCreds,
+            includeCredentials,
           );
           this.responseURL = response.finalUrl || url;
           this.status = response.status;
@@ -796,22 +807,8 @@
             return;
           }
 
-          const normalized = normalizeUrl(value);
-          if (!normalized) {
-            originalSet.call(this, value);
-            return;
-          }
-
           originalSet.call(this, value);
-          const el = this;
-
-          proxyMediaSource(value)
-            .then((proxied) => {
-              if (proxied && el.src === normalized) {
-                originalSet.call(el, proxied);
-              }
-            })
-            .catch(() => {});
+          proxyMediaSrc(this, value, originalSet);
         },
       });
     }
@@ -821,21 +818,8 @@
         return nativeSetAttr.call(this, name, value);
       }
 
-      const normalized = normalizeUrl(value);
-      if (!normalized) {
-        return nativeSetAttr.call(this, "src", value);
-      }
-
       nativeSetAttr.call(this, "src", value);
-      const el = this;
-
-      proxyMediaSource(value)
-        .then((proxied) => {
-          if (proxied && el.src === normalized) {
-            nativeSetAttr.call(el, "src", proxied);
-          }
-        })
-        .catch(() => {});
+      proxyMediaSrc(this, value, nativeSetAttr);
     };
 
     globalContext.addEventListener("beforeunload", cleanupStreamData);
@@ -861,7 +845,7 @@
       if (!body) throw new Error("Missing request body");
 
       const url = buildUrl(body.url, body);
-      const includeCreds = shouldIncludeCredentials(
+      const includeCredentials = shouldIncludeCredentials(
         url,
         body.credentials,
         body.withCredentials,
@@ -873,13 +857,13 @@
         headers: body.headers,
         data: deserializeRequestBody(body.body, body.bodyType),
         responseType: "arraybuffer",
-        withCredentials: includeCreds,
+        withCredentials: includeCredentials,
       });
 
       const headers = buildResponseHeaders(
         response.responseHeaders,
         null,
-        includeCreds,
+        includeCredentials,
       );
       const text = textDecoder.decode(responseToArrayBuffer(response));
       const contentType = headers["content-type"] || "";
