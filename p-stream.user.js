@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         P-Stream Userscript
 // @namespace    groknt
-// @version      1.5.0
+// @version      1.5.2
 // @description  A P-Stream compatible userscript
 // @author       groknt
 // @license      MIT
@@ -18,7 +18,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.5.0";
+  const VERSION = "1.5.2";
   const LOG_PREFIX = "P-Stream:";
 
   const MODIFIABLE_HEADERS = new Set([
@@ -183,8 +183,9 @@
       }
     }
 
-    parsed["access-control-allow-origin"] =
-      includeCredentials ? pageOrigin : "*";
+    parsed["access-control-allow-origin"] = includeCredentials
+      ? pageOrigin
+      : "*";
     parsed["access-control-allow-methods"] =
       "GET, POST, PUT, DELETE, PATCH, OPTIONS";
     parsed["access-control-allow-headers"] = "*";
@@ -391,34 +392,71 @@
       .catch(() => {});
   }
 
+  function coerceHeaders(source) {
+    if (!source) return null;
+    if (source instanceof Headers) return Object.fromEntries(source);
+    if (Array.isArray(source)) {
+      const out = {};
+      for (let i = 0; i < source.length; i++) {
+        const entry = source[i];
+        if (entry && entry.length >= 2) out[entry[0]] = entry[1];
+      }
+      return out;
+    }
+    if (typeof source === "object") return source;
+    return null;
+  }
+
   function patchFetch() {
     if (patchStatus.fetch) return;
     patchStatus.fetch = true;
 
     const nativeFetch = globalContext.fetch.bind(globalContext);
+    const RequestCtor =
+      typeof globalContext.Request === "function"
+        ? globalContext.Request
+        : null;
 
     globalContext.fetch = async function (input, init = {}) {
-      const url = normalizeUrl(typeof input === "string" ? input : input?.url);
+      const isRequest = RequestCtor && input instanceof RequestCtor;
+      const url = normalizeUrl(
+        isRequest ? input.url : typeof input === "string" ? input : input?.url,
+      );
       const rule = url && findMatchingRule(url);
       if (!rule) return nativeFetch(input, init);
 
+      const method =
+        init.method || (isRequest ? input.method : undefined) || "GET";
+      const credentialsMode =
+        init.credentials || (isRequest ? input.credentials : undefined);
+      const headerSource =
+        init.headers || (isRequest ? input.headers : undefined);
+
       const headers = {
         ...rule.requestHeaders,
-        ...(init.headers instanceof Headers
-          ? Object.fromEntries(init.headers)
-          : init.headers),
+        ...(coerceHeaders(headerSource) || {}),
       };
-      const includeCredentials = shouldIncludeCredentials(
-        url,
-        init.credentials,
-      );
+      const includeCredentials = shouldIncludeCredentials(url, credentialsMode);
+
+      let body = init.body;
+      if (
+        body === undefined &&
+        isRequest &&
+        method.toUpperCase() !== "GET" &&
+        method.toUpperCase() !== "HEAD"
+      ) {
+        try {
+          const buf = await input.clone().arrayBuffer();
+          if (buf.byteLength > 0) body = buf;
+        } catch {}
+      }
 
       try {
         const response = await executeGmRequest({
           url,
-          method: init.method || "GET",
+          method,
           headers,
-          data: normalizeRequestBody(init.body),
+          data: normalizeRequestBody(body),
           responseType: "arraybuffer",
           withCredentials: includeCredentials,
         });
@@ -459,6 +497,7 @@
         this._timeoutId = null;
         this._mimeOverride = "";
         this._nativeBound = false;
+        this._responseXML = null;
 
         this.readyState = 0;
         this.status = 0;
@@ -575,6 +614,7 @@
                 ? "application/xml"
                 : "text/html";
               this.response = new DOMParser().parseFromString(text, mime);
+              this._responseXML = this.response;
             } catch {
               this.response = null;
             }
@@ -614,12 +654,26 @@
       }
 
       open(method, url, async, username, password) {
+        if (this._timeoutId) {
+          clearTimeout(this._timeoutId);
+          this._timeoutId = null;
+        }
+
         this._method = method;
         this._url = normalizeUrl(url) || url;
         this._rule = findMatchingRule(this._url);
         this._useNative = !this._rule;
         this._aborted = false;
         this._reqHeaders = {};
+        this._resHeaders = null;
+        this._mimeOverride = "";
+        this._responseXML = null;
+
+        this.status = 0;
+        this.statusText = "";
+        this.response = null;
+        this.responseText = "";
+        this.responseURL = "";
 
         if (this._useNative) {
           this._native.open(
@@ -673,6 +727,17 @@
         this._mimeOverride = mime;
       }
 
+      get responseXML() {
+        if (this._useNative) {
+          try {
+            return this._native.responseXML;
+          } catch {
+            return null;
+          }
+        }
+        return this._responseXML;
+      }
+
       abort() {
         if (this._useNative) {
           return this._native.abort();
@@ -684,8 +749,18 @@
         }
 
         this._aborted = true;
+
+        const state = this.readyState;
+        if (state !== 0 && state !== 4) {
+          this.status = 0;
+          this.statusText = "";
+          this.readyState = 4;
+          this._emit("readystatechange");
+          this._emit("abort");
+          this._emit("loadend");
+        }
+
         this.readyState = 0;
-        this._emit("abort");
       }
 
       async send(body) {
@@ -775,7 +850,9 @@
           this.statusText = err.message || "";
           this.readyState = 4;
 
-          const type = err.message === "timeout" ? "timeout" : "error";
+          const msg = err.message || "";
+          const isTimeout = msg === "timeout" || msg === "Request timeout";
+          const type = isTimeout ? "timeout" : "error";
           this._emit("readystatechange");
           this._emit(type);
           this._emit("loadend");
