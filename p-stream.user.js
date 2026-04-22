@@ -42,11 +42,9 @@
   });
 
   const XHR_EVENT_TYPES = ["readystatechange", "load", "error", "timeout", "abort", "loadend", "progress", "loadstart"];
-
   const PROGRESS_EVENT_TYPES = new Set(["load", "error", "timeout", "abort", "loadend", "progress", "loadstart"]);
 
   const globalContext = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-
   const gmXmlHttpRequest =
     typeof GM_xmlhttpRequest === "function" ? GM_xmlhttpRequest : typeof GM?.xmlHttpRequest === "function" ? GM.xmlHttpRequest : null;
 
