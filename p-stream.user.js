@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         P-Stream Userscript
 // @namespace    groknt
-// @version      1.5.2
+// @version      1.5.3
 // @description  A P-Stream compatible userscript
 // @author       groknt
 // @license      MIT
@@ -18,7 +18,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.5.2";
+  const VERSION = "1.5.3";
   const LOG_PREFIX = "P-Stream:";
 
   const MODIFIABLE_HEADERS = new Set([
@@ -41,42 +41,17 @@
     DONE: 4,
   });
 
-  const XHR_EVENT_TYPES = [
-    "readystatechange",
-    "load",
-    "error",
-    "timeout",
-    "abort",
-    "loadend",
-    "progress",
-    "loadstart",
-  ];
+  const XHR_EVENT_TYPES = ["readystatechange", "load", "error", "timeout", "abort", "loadend", "progress", "loadstart"];
 
-  const PROGRESS_EVENT_TYPES = new Set([
-    "load",
-    "error",
-    "timeout",
-    "abort",
-    "loadend",
-    "progress",
-    "loadstart",
-  ]);
+  const PROGRESS_EVENT_TYPES = new Set(["load", "error", "timeout", "abort", "loadend", "progress", "loadstart"]);
 
-  const globalContext =
-    typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+  const globalContext = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
 
   const gmXmlHttpRequest =
-    typeof GM_xmlhttpRequest === "function"
-      ? GM_xmlhttpRequest
-      : typeof GM?.xmlHttpRequest === "function"
-        ? GM.xmlHttpRequest
-        : null;
+    typeof GM_xmlhttpRequest === "function" ? GM_xmlhttpRequest : typeof GM?.xmlHttpRequest === "function" ? GM.xmlHttpRequest : null;
 
   if (!gmXmlHttpRequest) {
-    console.warn(
-      LOG_PREFIX,
-      "GM_xmlhttpRequest unavailable — proxy requests will fail",
-    );
+    console.warn(LOG_PREFIX, "GM_xmlhttpRequest unavailable — proxy requests will fail");
   }
 
   const pageOrigin = (() => {
@@ -183,11 +158,8 @@
       }
     }
 
-    parsed["access-control-allow-origin"] = includeCredentials
-      ? pageOrigin
-      : "*";
-    parsed["access-control-allow-methods"] =
-      "GET, POST, PUT, DELETE, PATCH, OPTIONS";
+    parsed["access-control-allow-origin"] = includeCredentials ? pageOrigin : "*";
+    parsed["access-control-allow-methods"] = "GET, POST, PUT, DELETE, PATCH, OPTIONS";
     parsed["access-control-allow-headers"] = "*";
 
     if (includeCredentials) {
@@ -245,11 +217,28 @@
         return;
       }
 
+      options.headers ??= {};
+      const headers = options.headers;
+      let hasReferer = false,
+        hasOrigin = false;
+
+      for (const key in headers) {
+        if (!hasReferer && key.length === 7 && key.toLowerCase() === "referer") {
+          hasReferer = true;
+          if (hasOrigin) break;
+        } else if (!hasOrigin && key.length === 6 && key.toLowerCase() === "origin") {
+          hasOrigin = true;
+          if (hasReferer) break;
+        }
+      }
+
+      if (!hasReferer) headers["Referer"] = globalContext.location.href;
+      if (!hasOrigin) headers["Origin"] = pageOrigin;
+
       gmXmlHttpRequest({
         ...options,
         onload: resolve,
-        onerror: (err) =>
-          reject(new Error(err?.error || err?.message || "Network error")),
+        onerror: (err) => reject(new Error(err?.error || err?.message || "Network error")),
         ontimeout: () => reject(new Error("Request timeout")),
       });
     });
@@ -262,10 +251,7 @@
     const encoded = textEncoder.encode(response.responseText || "");
     return encoded.buffer.byteLength === encoded.byteLength
       ? encoded.buffer
-      : encoded.buffer.slice(
-          encoded.byteOffset,
-          encoded.byteOffset + encoded.byteLength,
-        );
+      : encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength);
   }
 
   function getCompiledRegex(pattern) {
@@ -291,8 +277,7 @@
       if (domains && domains.length > 0) {
         for (let i = 0; i < domains.length; i++) {
           const domain = domains[i];
-          if (hostname === domain || hostname.endsWith(`.${domain}`))
-            return rule;
+          if (hostname === domain || hostname.endsWith(`.${domain}`)) return rule;
         }
       }
 
@@ -314,9 +299,7 @@
   }
 
   function createBlobUrl(data, contentType) {
-    const url = URL.createObjectURL(
-      new Blob([data], { type: contentType || "application/octet-stream" }),
-    );
+    const url = URL.createObjectURL(new Blob([data], { type: contentType || "application/octet-stream" }));
     blobUrlRegistry.add(url);
     return url;
   }
@@ -362,8 +345,7 @@
           withCredentials: true,
         });
 
-        const contentType =
-          parseResponseHeaders(response.responseHeaders)["content-type"] || "";
+        const contentType = parseResponseHeaders(response.responseHeaders)["content-type"] || "";
         if (isStreamingContent(contentType, normalized)) return null;
 
         return createBlobUrl(responseToArrayBuffer(response), contentType);
@@ -412,25 +394,17 @@
     patchStatus.fetch = true;
 
     const nativeFetch = globalContext.fetch.bind(globalContext);
-    const RequestCtor =
-      typeof globalContext.Request === "function"
-        ? globalContext.Request
-        : null;
+    const RequestCtor = typeof globalContext.Request === "function" ? globalContext.Request : null;
 
     globalContext.fetch = async function (input, init = {}) {
       const isRequest = RequestCtor && input instanceof RequestCtor;
-      const url = normalizeUrl(
-        isRequest ? input.url : typeof input === "string" ? input : input?.url,
-      );
+      const url = normalizeUrl(isRequest ? input.url : typeof input === "string" ? input : input?.url);
       const rule = url && findMatchingRule(url);
       if (!rule) return nativeFetch(input, init);
 
-      const method =
-        init.method || (isRequest ? input.method : undefined) || "GET";
-      const credentialsMode =
-        init.credentials || (isRequest ? input.credentials : undefined);
-      const headerSource =
-        init.headers || (isRequest ? input.headers : undefined);
+      const method = init.method || (isRequest ? input.method : undefined) || "GET";
+      const credentialsMode = init.credentials || (isRequest ? input.credentials : undefined);
+      const headerSource = init.headers || (isRequest ? input.headers : undefined);
 
       const headers = {
         ...rule.requestHeaders,
@@ -439,12 +413,7 @@
       const includeCredentials = shouldIncludeCredentials(url, credentialsMode);
 
       let body = init.body;
-      if (
-        body === undefined &&
-        isRequest &&
-        method.toUpperCase() !== "GET" &&
-        method.toUpperCase() !== "HEAD"
-      ) {
+      if (body === undefined && isRequest && method.toUpperCase() !== "GET" && method.toUpperCase() !== "HEAD") {
         try {
           const buf = await input.clone().arrayBuffer();
           if (buf.byteLength > 0) body = buf;
@@ -464,11 +433,7 @@
         return new Response(responseToArrayBuffer(response), {
           status: response.status,
           statusText: response.statusText || "",
-          headers: buildResponseHeaders(
-            response.responseHeaders,
-            rule.responseHeaders,
-            includeCredentials,
-          ),
+          headers: buildResponseHeaders(response.responseHeaders, rule.responseHeaders, includeCredentials),
         });
       } catch (err) {
         console.warn(LOG_PREFIX, "Fetch proxy failed:", err.message);
@@ -581,10 +546,7 @@
       }
 
       _applyResponse(buffer) {
-        const contentType =
-          this.getResponseHeader("content-type") ||
-          this._mimeOverride ||
-          "application/octet-stream";
+        const contentType = this.getResponseHeader("content-type") || this._mimeOverride || "application/octet-stream";
 
         switch (this.responseType) {
           case "arraybuffer":
@@ -610,9 +572,7 @@
             const text = textDecoder.decode(buffer);
             this.responseText = text;
             try {
-              const mime = contentType.includes("xml")
-                ? "application/xml"
-                : "text/html";
+              const mime = contentType.includes("xml") ? "application/xml" : "text/html";
               this.response = new DOMParser().parseFromString(text, mime);
               this._responseXML = this.response;
             } catch {
@@ -676,13 +636,7 @@
         this.responseURL = "";
 
         if (this._useNative) {
-          this._native.open(
-            method,
-            url,
-            async !== undefined ? async : true,
-            username,
-            password,
-          );
+          this._native.open(method, url, async !== undefined ? async : true, username, password);
           this.readyState = this._native.readyState;
           return;
         }
@@ -774,13 +728,8 @@
 
         const { _rule: rule, _url: url, _method: method } = this;
         const headers = { ...rule.requestHeaders, ...this._reqHeaders };
-        const includeCredentials = shouldIncludeCredentials(
-          url,
-          this.withCredentials ? "include" : undefined,
-          this.withCredentials,
-        );
-        const wantBinary =
-          this.responseType === "arraybuffer" || this.responseType === "blob";
+        const includeCredentials = shouldIncludeCredentials(url, this.withCredentials ? "include" : undefined, this.withCredentials);
+        const wantBinary = this.responseType === "arraybuffer" || this.responseType === "blob";
 
         const reqPromise = executeGmRequest({
           url,
@@ -794,19 +743,14 @@
         let timeoutPromise;
         if (this.timeout > 0) {
           timeoutPromise = new Promise((_, reject) => {
-            this._timeoutId = setTimeout(
-              () => reject(new Error("timeout")),
-              this.timeout,
-            );
+            this._timeoutId = setTimeout(() => reject(new Error("timeout")), this.timeout);
           });
         }
 
         this._emit("loadstart");
 
         try {
-          const response = await (timeoutPromise
-            ? Promise.race([reqPromise, timeoutPromise])
-            : reqPromise);
+          const response = await (timeoutPromise ? Promise.race([reqPromise, timeoutPromise]) : reqPromise);
 
           if (this._timeoutId) {
             clearTimeout(this._timeoutId);
@@ -814,11 +758,7 @@
           }
           if (this._aborted) return;
 
-          this._resHeaders = buildResponseHeaders(
-            response.responseHeaders,
-            rule.responseHeaders,
-            includeCredentials,
-          );
+          this._resHeaders = buildResponseHeaders(response.responseHeaders, rule.responseHeaders, includeCredentials);
           this.responseURL = response.finalUrl || url;
           this.status = response.status;
           this.statusText = response.statusText || "";
@@ -922,11 +862,7 @@
       if (!body) throw new Error("Missing request body");
 
       const url = buildUrl(body.url, body);
-      const includeCredentials = shouldIncludeCredentials(
-        url,
-        body.credentials,
-        body.withCredentials,
-      );
+      const includeCredentials = shouldIncludeCredentials(url, body.credentials, body.withCredentials);
 
       const response = await executeGmRequest({
         url,
@@ -937,11 +873,7 @@
         withCredentials: includeCredentials,
       });
 
-      const headers = buildResponseHeaders(
-        response.responseHeaders,
-        null,
-        includeCredentials,
-      );
+      const headers = buildResponseHeaders(response.responseHeaders, null, includeCredentials);
       const text = textDecoder.decode(responseToArrayBuffer(response));
       const contentType = headers["content-type"] || "";
 
@@ -1002,11 +934,7 @@
   function setupMessageRelay(name, handler) {
     globalContext.addEventListener("message", async (event) => {
       const data = event.data;
-      if (
-        event.source !== globalContext ||
-        data?.name !== name ||
-        data?.relayed
-      ) {
+      if (event.source !== globalContext || data?.name !== name || data?.relayed) {
         return;
       }
 
@@ -1014,10 +942,7 @@
 
       try {
         const result = await handler(body);
-        globalContext.postMessage(
-          { name, instanceId, body: result, relayed: true },
-          "/",
-        );
+        globalContext.postMessage({ name, instanceId, body: result, relayed: true }, "/");
       } catch (err) {
         console.error(LOG_PREFIX, `${name} handler failed:`, err.message);
         globalContext.postMessage(
