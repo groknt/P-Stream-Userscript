@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         P-Stream Userscript
 // @namespace    groknt
-// @version      2.0.0
+// @version      2.0.1
 // @description  A P-Stream compatible userscript
 // @author       groknt
 // @license      MIT
@@ -21,7 +21,10 @@
   const CONFIG = {
     extensionVersion: "1.5.0",
     logPrefix: "P-Stream:",
-    maxMediaSize: 100 * 1024 * 1024,
+    maxMediaSize: {
+      enabled: false,
+      value: 100 * 1024 * 1024,
+    },
   };
 
   const win = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
@@ -447,7 +450,7 @@
           if (
             contentType &&
             RE_CONTENT_MEDIA.test(contentType) &&
-            (acceptRanges?.includes("bytes") || len > CONFIG.maxMediaSize || isNaN(len))
+            (acceptRanges?.includes("bytes") || (CONFIG.maxMediaSize.enabled && len > CONFIG.maxMediaSize.value) || isNaN(len))
           )
             return;
         }
