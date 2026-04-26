@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         P-Stream Userscript
 // @namespace    groknt
-// @version      1.6.0
+// @version      2.0.0
 // @description  A P-Stream compatible userscript
 // @author       groknt
 // @license      MIT
@@ -15,11 +15,27 @@
 // @downloadURL  https://raw.githubusercontent.com/groknt/P-Stream-Userscript/main/p-stream.user.js
 // ==/UserScript==
 
-(function () {
+(function (GM) {
   "use strict";
 
-  const VERSION = "1.6.0";
-  const LOG_PREFIX = "P-Stream:";
+  const CONFIG = {
+    extensionVersion: "1.5.0",
+    logPrefix: "P-Stream:",
+    maxMediaSize: 100 * 1024 * 1024,
+  };
+
+  const win = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+  if (!GM) console.warn(`${CONFIG.logPrefix} GM_xmlhttpRequest missing - proxy will fail`);
+
+  const pageOrigin = win.location.origin !== "null" ? win.location.origin : new URL(win.location.href).origin || "*";
+  const rules = new Map();
+  const mediaBlobs = new WeakMap();
+  const activeMediaReqs = new WeakMap();
+  let patchStatus = false;
+
+  const RE_STREAM_MANIFEST = /\.(m3u8|mpd|ism|isml)([\?\/#]|$)/i;
+  const RE_STREAM_MEDIA = /\.(mp4|m4v|m4a|webm|mkv|mov|avi|wmv|mp3|ogg|ogv|flac|wav)([\?\/#]|$)/i;
+  const RE_CONTENT_MEDIA = /video|audio/i;
 
   const MODIFIABLE_HEADERS = new Set([
     "access-control-allow-origin",
@@ -30,1063 +46,572 @@
     "content-disposition",
   ]);
 
-  const STREAMING_EXTENSIONS_RE = /\.(m3u8|mpd)(?:\?|$)/i;
-  const STREAMING_MIME_TYPES = ["mpegurl", "dash+xml"];
-
-  const XHR_STATES = Object.freeze({
-    UNSENT: 0,
-    OPENED: 1,
-    HEADERS_RECEIVED: 2,
-    LOADING: 3,
-    DONE: 4,
-  });
-
-  const XHR_EVENT_TYPES = ["readystatechange", "load", "error", "timeout", "abort", "loadend", "progress", "loadstart"];
-  const PROGRESS_EVENT_TYPES = new Set(["load", "error", "timeout", "abort", "loadend", "progress", "loadstart"]);
-
-  const globalContext = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-  const gmXmlHttpRequest =
-    typeof GM_xmlhttpRequest === "function" ? GM_xmlhttpRequest : typeof GM?.xmlHttpRequest === "function" ? GM.xmlHttpRequest : null;
-
-  if (!gmXmlHttpRequest) {
-    console.warn(LOG_PREFIX, "GM_xmlhttpRequest unavailable — proxy requests will fail");
-  }
-
-  const pageOrigin = (() => {
+  const normalizeUrl = (url) => {
     try {
-      const { origin, href } = globalContext.location;
-      return origin !== "null" ? origin : new URL(href).origin;
+      return new URL(url, win.location.href).href;
     } catch {
-      return "*";
+      return String(url);
     }
-  })();
+  };
 
-  const proxyRules = new Map();
-  const proxyCache = new Map();
-  const regexCache = new Map();
-  const mediaBlobMap = new WeakMap();
-  let mediaObserver = null;
-  const patchStatus = { fetch: false, xhr: false, media: false };
-
-  const textDecoder = new TextDecoder();
-  const textEncoder = new TextEncoder();
-
-  function parseUrl(input) {
-    if (!input) return null;
+  const getRule = (url) => {
+    if (!url) return null;
+    let u;
     try {
-      return new URL(input, globalContext.location.href);
+      u = new URL(url, win.location.href);
     } catch {
       return null;
     }
-  }
 
-  function normalizeUrl(input, base) {
-    if (!input) return null;
-    try {
-      return new URL(input, base || globalContext.location.href).href;
-    } catch {
-      return null;
+    const hostname = u.hostname;
+    const href = u.href;
+
+    for (const rule of rules.values()) {
+      if (rule.targetDomains) {
+        for (let i = 0; i < rule.targetDomains.length; i++) {
+          const d = rule.targetDomains[i];
+          if (hostname === d || hostname.endsWith(`.${d}`)) return rule;
+        }
+      }
+      if (rule._compiledRegex && rule._compiledRegex.test(href)) return rule;
     }
-  }
+    return null;
+  };
 
-  function isSameOrigin(url) {
+  const parseHeaders = (raw) => {
+    const h = new Headers();
+    if (!raw) return h;
+    const lines = raw.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const idx = lines[i].indexOf(":");
+      if (idx > 0) h.append(lines[i].slice(0, idx).trim(), lines[i].slice(idx + 1).trim());
+    }
+    return h;
+  };
+
+  const shouldIncludeCredentials = (url, mode, force) => {
+    if (force || mode === "include") return true;
+    if (mode === "omit") return false;
     try {
       return new URL(url).origin === pageOrigin;
     } catch {
       return false;
     }
-  }
+  };
 
-  function buildUrl(url, options = {}) {
-    const { baseUrl, query } = options;
+  const isMediaStream = (url, headersObj) => {
+    if (RE_STREAM_MANIFEST.test(url)) return false;
 
-    let fullUrl;
-    if (/^https?:\/\//i.test(url)) {
-      fullUrl = url;
-    } else if (baseUrl) {
-      const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
-      const path = url.startsWith("/") ? url.slice(1) : url;
-      fullUrl = `${base}${path}`;
-    } else {
-      fullUrl = url;
+    for (const k in headersObj) {
+      if (k.toLowerCase() === "range" && headersObj[k].startsWith("bytes=")) return false;
     }
 
-    if (!/^https?:\/\//i.test(fullUrl)) {
-      throw new Error(`Invalid URL scheme: ${fullUrl}`);
-    }
+    if (RE_STREAM_MEDIA.test(url)) return true;
 
-    if (!query || Object.keys(query).length === 0) return fullUrl;
-
-    const parsed = new URL(fullUrl);
-    for (const key in query) {
-      parsed.searchParams.set(key, query[key]);
-    }
-    return parsed.href;
-  }
-
-  function parseResponseHeaders(raw) {
-    const headers = Object.create(null);
-    if (!raw) return headers;
-
-    const lines = raw.split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const idx = line.indexOf(":");
-      if (idx === -1) continue;
-
-      const key = line.slice(0, idx).trim().toLowerCase();
-      if (!key) continue;
-
-      const value = line.slice(idx + 1).trim();
-      const existing = headers[key];
-      headers[key] = existing ? `${existing}, ${value}` : value;
-    }
-    return headers;
-  }
-
-  function buildResponseHeaders(raw, ruleHeaders, includeCredentials) {
-    const parsed = parseResponseHeaders(raw);
-
-    for (const key of MODIFIABLE_HEADERS) {
-      delete parsed[key];
-    }
-
-    if (ruleHeaders) {
-      for (const key in ruleHeaders) {
-        parsed[key] = ruleHeaders[key];
-      }
-    }
-
-    parsed["access-control-allow-origin"] = includeCredentials ? pageOrigin : "*";
-    parsed["access-control-allow-methods"] = "GET, POST, PUT, DELETE, PATCH, OPTIONS";
-    parsed["access-control-allow-headers"] = "*";
-
-    if (includeCredentials) {
-      parsed["access-control-allow-credentials"] = "true";
-    }
-
-    return parsed;
-  }
-
-  function shouldIncludeCredentials(url, credentialsMode, force) {
-    if (force || credentialsMode === "include") return true;
-    if (credentialsMode === "omit") return false;
-    return isSameOrigin(url);
-  }
-
-  function normalizeRequestBody(body) {
-    if (body == null) return undefined;
-    if (
-      typeof body === "string" ||
-      body instanceof FormData ||
-      body instanceof Blob ||
-      body instanceof ArrayBuffer ||
-      ArrayBuffer.isView(body)
-    ) {
-      return body;
-    }
-    if (body instanceof URLSearchParams) return body.toString();
-    if (typeof body === "object") return JSON.stringify(body);
-    return body;
-  }
-
-  function deserializeRequestBody(body, bodyType) {
-    if (body == null) return undefined;
-    switch (bodyType) {
-      case "FormData": {
-        const formData = new FormData();
-        for (const [key, value] of body) {
-          formData.append(key, value);
-        }
-        return formData;
-      }
-      case "URLSearchParams":
-        return new URLSearchParams(body);
-      case "object":
-        return JSON.stringify(body);
-      default:
-        return body;
-    }
-  }
-
-  function executeGmRequest(options) {
-    return new Promise((resolve, reject) => {
-      if (!gmXmlHttpRequest) {
-        reject(new Error("GM_xmlhttpRequest unavailable"));
-        return;
-      }
-
-      options.headers ??= {};
-      const headers = options.headers;
-      let hasReferer = false,
-        hasOrigin = false;
-
-      for (const key in headers) {
-        if (!hasReferer && key.length === 7 && key.toLowerCase() === "referer") {
-          hasReferer = true;
-          if (hasOrigin) break;
-        } else if (!hasOrigin && key.length === 6 && key.toLowerCase() === "origin") {
-          hasOrigin = true;
-          if (hasReferer) break;
-        }
-      }
-
-      if (!hasReferer) headers["Referer"] = globalContext.location.href;
-      if (!hasOrigin) headers["Origin"] = pageOrigin;
-
-      gmXmlHttpRequest({
-        ...options,
-        onload: resolve,
-        onerror: (err) => reject(new Error(err?.error || err?.message || "Network error")),
-        ontimeout: () => reject(new Error("Request timeout")),
-      });
-    });
-  }
-
-  function responseToArrayBuffer(response) {
-    if (response.response instanceof ArrayBuffer) {
-      return response.response;
-    }
-    const encoded = textEncoder.encode(response.responseText || "");
-    return encoded.buffer.byteLength === encoded.byteLength
-      ? encoded.buffer
-      : encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength);
-  }
-
-  function getCompiledRegex(pattern) {
-    let cached = regexCache.get(pattern);
-    if (cached !== undefined) return cached;
-    try {
-      cached = new RegExp(pattern);
-    } catch {
-      cached = null;
-    }
-    regexCache.set(pattern, cached);
-    return cached;
-  }
-
-  function findMatchingRule(url) {
-    const parsed = parseUrl(url);
-    if (!parsed) return null;
-
-    const { href, hostname } = parsed;
-
-    for (const rule of proxyRules.values()) {
-      const domains = rule.targetDomains;
-      if (domains && domains.length > 0) {
-        for (let i = 0; i < domains.length; i++) {
-          const domain = domains[i];
-          if (hostname === domain || hostname.endsWith(`.${domain}`)) return rule;
-        }
-      }
-
-      if (rule.targetRegex) {
-        const regex = getCompiledRegex(rule.targetRegex);
-        if (regex && regex.test(href)) return rule;
-      }
-    }
-
-    return null;
-  }
-
-  function isStreamingContent(contentType, url) {
-    if (STREAMING_EXTENSIONS_RE.test(url)) return true;
-    for (let i = 0; i < STREAMING_MIME_TYPES.length; i++) {
-      if (contentType.includes(STREAMING_MIME_TYPES[i])) return true;
-    }
     return false;
-  }
+  };
 
-  function createBlobUrl(data, contentType) {
-    return URL.createObjectURL(new Blob([data], { type: contentType || "application/octet-stream" }));
-  }
+  const gmFetch = (opts) =>
+    new Promise((resolve, reject) => {
+      opts.headers = opts.headers || {};
+      let hasReferer = false;
+      let hasOrigin = false;
 
-  function cleanupStreamData() {
-    proxyCache.clear();
-  }
-
-  function createXhrEvent(type, loaded, total) {
-    if (PROGRESS_EVENT_TYPES.has(type)) {
-      return new ProgressEvent(type, {
-        lengthComputable: total > 0,
-        loaded: loaded || 0,
-        total: total || 0,
-      });
-    }
-    return new Event(type);
-  }
-
-  function proxyMediaSource(url) {
-    const normalized = normalizeUrl(url);
-    if (!normalized) return Promise.resolve(null);
-
-    const rule = findMatchingRule(normalized);
-    if (!rule) return Promise.resolve(null);
-
-    const cached = proxyCache.get(normalized);
-    if (cached) return cached;
-
-    const promise = (async () => {
-      try {
-        const response = await executeGmRequest({
-          url: normalized,
-          method: "GET",
-          headers: rule.requestHeaders,
-          responseType: "arraybuffer",
-          withCredentials: true,
-        });
-
-        const contentType = parseResponseHeaders(response.responseHeaders)["content-type"] || "";
-        if (isStreamingContent(contentType, normalized)) return null;
-
-        return { data: responseToArrayBuffer(response), contentType };
-      } catch (err) {
-        console.warn(LOG_PREFIX, "Media proxy failed:", err.message);
-        return null;
-      } finally {
-        setTimeout(() => proxyCache.delete(normalized), 1000);
+      for (const k in opts.headers) {
+        const lowerK = k.toLowerCase();
+        if (lowerK === "referer") hasReferer = true;
+        if (lowerK === "origin") hasOrigin = true;
       }
-    })();
 
-    proxyCache.set(normalized, promise);
-    return promise;
-  }
+      if (!hasReferer) opts.headers["Referer"] = win.location.href;
+      if (!hasOrigin) opts.headers["Origin"] = pageOrigin;
 
-  function proxyMediaSrc(element, value, nativeSetter) {
-    const normalized = normalizeUrl(value);
-    if (!normalized) return;
+      const { signal, ...gmOpts } = opts;
+      let req;
+      let abortHandler;
 
-    const expectedSrc = normalized;
-
-    const oldBlob = mediaBlobMap.get(element);
-    if (oldBlob) {
-      URL.revokeObjectURL(oldBlob);
-      mediaBlobMap.delete(element);
-    }
-
-    proxyMediaSource(value)
-      .then((result) => {
-        if (!result || element.src !== expectedSrc) return;
-        const blobUrl = createBlobUrl(result.data, result.contentType);
-        mediaBlobMap.set(element, blobUrl);
-        nativeSetter.call(element, blobUrl);
-      })
-      .catch(() => {});
-  }
-
-  function coerceHeaders(source) {
-    if (!source) return null;
-    if (source instanceof Headers) return Object.fromEntries(source);
-    if (Array.isArray(source)) {
-      const out = {};
-      for (let i = 0; i < source.length; i++) {
-        const entry = source[i];
-        if (entry && entry.length >= 2) out[entry[0]] = entry[1];
-      }
-      return out;
-    }
-    if (typeof source === "object") return source;
-    return null;
-  }
-
-  function patchFetch() {
-    if (patchStatus.fetch) return;
-    patchStatus.fetch = true;
-
-    const nativeFetch = globalContext.fetch.bind(globalContext);
-    const RequestCtor = typeof globalContext.Request === "function" ? globalContext.Request : null;
-
-    globalContext.fetch = async function (input, init = {}) {
-      const isRequest = RequestCtor && input instanceof RequestCtor;
-      const url = normalizeUrl(isRequest ? input.url : typeof input === "string" ? input : input?.url);
-      const rule = url && findMatchingRule(url);
-      if (!rule) return nativeFetch(input, init);
-
-      const method = init.method || (isRequest ? input.method : undefined) || "GET";
-      const credentialsMode = init.credentials || (isRequest ? input.credentials : undefined);
-      const headerSource = init.headers || (isRequest ? input.headers : undefined);
-
-      const headers = {
-        ...rule.requestHeaders,
-        ...(coerceHeaders(headerSource) || {}),
+      const cleanup = () => {
+        if (signal && abortHandler) {
+          signal.removeEventListener("abort", abortHandler);
+        }
+        req = null;
       };
-      const includeCredentials = shouldIncludeCredentials(url, credentialsMode);
+
+      if (signal && signal.aborted) {
+        return reject(new Error("Aborted"));
+      }
+
+      req = GM({
+        ...gmOpts,
+        onload: (res) => {
+          cleanup();
+          resolve(res);
+        },
+        onerror: (e) => {
+          cleanup();
+          reject(new Error(e?.error || e?.message || "Network Error"));
+        },
+        ontimeout: () => {
+          cleanup();
+          reject(new Error("Timeout"));
+        },
+        onabort: () => {
+          cleanup();
+          reject(new Error("Aborted"));
+        },
+      });
+
+      if (signal) {
+        abortHandler = () => {
+          if (req && typeof req.abort === "function") req.abort();
+          cleanup();
+          reject(new Error("Aborted"));
+        };
+        signal.addEventListener("abort", abortHandler);
+      }
+    });
+
+  const patchFetch = () => {
+    const origFetch = win.fetch;
+    win.fetch = async (input, init = {}) => {
+      const isReq = typeof input === "object" && input instanceof Request;
+      const rawUrl = isReq ? input.url : input instanceof URL ? input.href : String(input);
+      const urlStr = normalizeUrl(rawUrl);
+      const rule = getRule(urlStr);
+
+      if (!rule) return origFetch(input, init);
+
+      const method = init.method || (isReq ? input.method : "GET");
+      const reqHeaders = new Headers();
+
+      if (isReq && input.headers) {
+        input.headers.forEach((v, k) => reqHeaders.set(k, v));
+      }
+      if (init.headers) {
+        new Headers(init.headers).forEach((v, k) => reqHeaders.set(k, v));
+      }
+
+      if (rule.requestHeaders) {
+        for (const k in rule.requestHeaders) reqHeaders.set(k, rule.requestHeaders[k]);
+      }
+
+      const gmHeaders = Object.fromEntries(reqHeaders.entries());
+      if (isMediaStream(urlStr, gmHeaders)) return origFetch(input, { ...init, headers: gmHeaders });
 
       let body = init.body;
-      if (body === undefined && isRequest && method.toUpperCase() !== "GET" && method.toUpperCase() !== "HEAD") {
+      if (body !== undefined && typeof ReadableStream !== "undefined" && body instanceof ReadableStream) {
         try {
-          const buf = await input.clone().arrayBuffer();
-          if (buf.byteLength > 0) body = buf;
+          body = await new Response(body).arrayBuffer();
+        } catch {}
+      } else if (body === undefined && isReq && method !== "GET" && method !== "HEAD") {
+        try {
+          body = await input.clone().arrayBuffer();
         } catch {}
       }
 
+      const credMode = init.credentials || (isReq ? input.credentials : undefined);
+
       try {
-        const response = await executeGmRequest({
-          url,
+        const res = await gmFetch({
           method,
-          headers,
-          data: normalizeRequestBody(body),
+          url: urlStr,
+          headers: gmHeaders,
+          data: body,
           responseType: "arraybuffer",
-          withCredentials: includeCredentials,
+          withCredentials: shouldIncludeCredentials(urlStr, credMode),
+          signal: init.signal || (isReq ? input.signal : undefined),
         });
 
-        return new Response(responseToArrayBuffer(response), {
-          status: response.status,
-          statusText: response.statusText || "",
-          headers: buildResponseHeaders(response.responseHeaders, rule.responseHeaders, includeCredentials),
+        const resHeaders = new Headers();
+        const parsedResHeaders = parseHeaders(res.responseHeaders);
+        parsedResHeaders.forEach((v, k) => {
+          if (!MODIFIABLE_HEADERS.has(k)) resHeaders.set(k, v);
         });
-      } catch (err) {
-        console.warn(LOG_PREFIX, "Fetch proxy failed:", err.message);
-        return nativeFetch(input, init);
+
+        if (rule.responseHeaders) {
+          for (const k in rule.responseHeaders) resHeaders.set(k, rule.responseHeaders[k]);
+        }
+        resHeaders.set("access-control-allow-origin", "*");
+
+        return new Response(res.response, { status: res.status, statusText: res.statusText, headers: resHeaders });
+      } catch (e) {
+        if (e.message !== "Aborted") console.warn(`${CONFIG.logPrefix} Fetch proxy failed`, e);
+        return origFetch(input, init);
       }
     };
-  }
+  };
 
-  function patchXhr() {
-    if (patchStatus.xhr) return;
-    patchStatus.xhr = true;
-
-    const NativeXHR = globalContext.XMLHttpRequest;
-
-    class ProxyXMLHttpRequest {
+  const patchXhr = () => {
+    const OrigXHR = win.XMLHttpRequest;
+    win.XMLHttpRequest = class XhrProxy extends OrigXHR {
       constructor() {
-        this._native = new NativeXHR();
-        this._useNative = true;
-        this._listeners = new Map();
-        this._reqHeaders = {};
-        this._resHeaders = null;
-        this._rule = null;
-        this._url = "";
-        this._method = "GET";
-        this._aborted = false;
-        this._timeoutId = null;
-        this._mimeOverride = "";
-        this._nativeBound = false;
-        this._responseXML = null;
-
-        this._readyState = 0;
-        this._status = 0;
-        this._statusText = "";
-        this._response = null;
-        this._responseText = "";
-        this._responseURL = "";
-        this.responseType = "";
-        this.withCredentials = false;
-        this.timeout = 0;
-        this.upload = this._native.upload;
-
-        this.onreadystatechange = null;
-        this.onload = null;
-        this.onerror = null;
-        this.ontimeout = null;
-        this.onabort = null;
-        this.onloadend = null;
-        this.onprogress = null;
-        this.onloadstart = null;
+        super();
+        this._st = null;
       }
-
-      _emit(type, event) {
-        if (!event) event = createXhrEvent(type);
-
-        const handler = this[`on${type}`];
-        if (handler) {
-          try {
-            handler.call(this, event);
-          } catch (err) {
-            console.error(LOG_PREFIX, "XHR handler error:", err);
+      open(method, url, ...args) {
+        const urlStr = normalizeUrl(url instanceof URL ? url.href : String(url));
+        const rule = getRule(urlStr);
+        if (rule) {
+          this._st = {
+            rule,
+            method,
+            url: urlStr,
+            reqHeaders: {},
+            resHeaders: new Headers(),
+            readyState: 1,
+            status: 0,
+            statusText: "",
+            response: null,
+            responseText: "",
+            responseURL: urlStr,
+            controller: new AbortController(),
+          };
+          this.dispatchEvent(new Event("readystatechange"));
+        } else {
+          this._st = null;
+          super.open(method, url, ...args);
+        }
+      }
+      setRequestHeader(name, value) {
+        if (this._st) this._st.reqHeaders[name] = value;
+        else super.setRequestHeader(name, value);
+      }
+      abort() {
+        if (this._st) {
+          this._st.controller.abort();
+          if (this._st.readyState > 0 && this._st.readyState < 4) {
+            this._st.readyState = 0;
+            this._st.status = 0;
+            this.dispatchEvent(new Event("readystatechange"));
+            this.dispatchEvent(new Event("abort"));
+            this.dispatchEvent(new ProgressEvent("loadend", { lengthComputable: false, loaded: 0, total: 0 }));
           }
         }
+        super.abort();
+      }
+      send(body) {
+        if (!this._st) return super.send(body);
 
-        const list = this._listeners.get(type);
-        if (list && list.length > 0) {
-          const snapshot = list.slice();
-          for (let i = 0; i < snapshot.length; i++) {
-            try {
-              snapshot[i].call(this, event);
-            } catch (err) {
-              console.error(LOG_PREFIX, "XHR listener error:", err);
+        const mergedHeaders = { ...this._st.rule.requestHeaders, ...this._st.reqHeaders };
+        if (isMediaStream(this._st.url, mergedHeaders)) {
+          this._st = null;
+          return super.send(body);
+        }
+
+        const isBinary = this.responseType === "arraybuffer" || this.responseType === "blob";
+
+        gmFetch({
+          method: this._st.method,
+          url: this._st.url,
+          headers: mergedHeaders,
+          data: body,
+          responseType: isBinary ? "arraybuffer" : "text",
+          timeout: this.timeout,
+          withCredentials: shouldIncludeCredentials(this._st.url, this.withCredentials ? "include" : undefined, this.withCredentials),
+          signal: this._st.controller.signal,
+        })
+          .then((res) => {
+            if (!this._st || this._st.controller.signal.aborted) return;
+
+            const st = this._st;
+            st.resHeaders = parseHeaders(res.responseHeaders);
+            st.status = res.status;
+            st.statusText = res.statusText || "OK";
+            st.responseURL = res.finalUrl || st.url;
+
+            let data = res.response;
+            if (this.responseType === "json") {
+              try {
+                data = JSON.parse(res.responseText);
+              } catch {
+                data = null;
+              }
+            } else if (this.responseType === "blob") {
+              data = new Blob([res.response], { type: st.resHeaders.get("content-type") || "" });
+            } else if (!isBinary) {
+              data = res.responseText;
+              st.responseText = data;
             }
-          }
-        }
+            st.response = data;
+
+            st.readyState = 2;
+            this.dispatchEvent(new Event("readystatechange"));
+            if (!this._st || this._st.readyState !== 2) return;
+
+            st.readyState = 3;
+            this.dispatchEvent(new Event("readystatechange"));
+            if (!this._st || this._st.readyState !== 3) return;
+
+            this.dispatchEvent(new ProgressEvent("progress", { lengthComputable: true, loaded: 1, total: 1 }));
+            if (!this._st) return;
+
+            st.readyState = 4;
+            this.dispatchEvent(new Event("readystatechange"));
+            this.dispatchEvent(new ProgressEvent("load", { lengthComputable: true, loaded: 1, total: 1 }));
+            this.dispatchEvent(new ProgressEvent("loadend", { lengthComputable: true, loaded: 1, total: 1 }));
+          })
+          .catch((err) => {
+            if (this._st && this._st.controller.signal.aborted) return;
+            if (this._st) {
+              this._st.readyState = 4;
+              this._st.status = 0;
+              this._st.statusText = "";
+            }
+            this.dispatchEvent(new Event("readystatechange"));
+            this.dispatchEvent(new Event("error"));
+            this.dispatchEvent(new ProgressEvent("loadend", { lengthComputable: false, loaded: 0, total: 0 }));
+          });
       }
 
       get readyState() {
-        if (this._useNative) {
-          try {
-            return this._native.readyState;
-          } catch {
-            return this._readyState;
-          }
-        }
-        return this._readyState;
+        return this._st ? this._st.readyState : super.readyState;
       }
-      set readyState(value) {
-        this._readyState = value;
-      }
-
       get status() {
-        if (this._useNative) {
-          try {
-            return this._native.status;
-          } catch {
-            return this._status;
-          }
-        }
-        return this._status;
+        return this._st ? this._st.status : super.status;
       }
-      set status(value) {
-        this._status = value;
-      }
-
       get statusText() {
-        if (this._useNative) {
-          try {
-            return this._native.statusText;
-          } catch {
-            return this._statusText;
-          }
-        }
-        return this._statusText;
+        return this._st ? this._st.statusText : super.statusText;
       }
-      set statusText(value) {
-        this._statusText = value;
-      }
-
       get response() {
-        if (this._useNative) {
-          try {
-            return this._native.response;
-          } catch {
-            return this._response;
-          }
-        }
-        return this._response;
+        return this._st ? this._st.response : super.response;
       }
-      set response(value) {
-        this._response = value;
-      }
-
       get responseText() {
-        if (this._useNative) {
-          try {
-            const nativeResponseType = this._native.responseType;
-            if (!nativeResponseType || nativeResponseType === "text") {
-              return this._native.responseText;
-            }
-          } catch {
-            return this._responseText;
-          }
-        }
-        return this._responseText;
+        return this._st ? this._st.responseText : super.responseText;
       }
-      set responseText(value) {
-        this._responseText = value;
-      }
-
       get responseURL() {
-        if (this._useNative) {
-          try {
-            return this._native.responseURL;
-          } catch {
-            return this._responseURL;
-          }
-        }
-        return this._responseURL;
+        return this._st ? this._st.responseURL : super.responseURL;
       }
-      set responseURL(value) {
-        this._responseURL = value;
-      }
-
-      _bindNative() {
-        if (this._nativeBound) return;
-        this._nativeBound = true;
-
-        const self = this;
-        for (let i = 0; i < XHR_EVENT_TYPES.length; i++) {
-          const type = XHR_EVENT_TYPES[i];
-          this._native.addEventListener(type, function (event) {
-            self._emit(type, event);
-          });
-        }
-      }
-
-      _retryWithNative(body) {
-        const retryXhr = new NativeXHR();
-        retryXhr.open(this._method, this._url, true);
-        retryXhr.withCredentials = this.withCredentials;
-        retryXhr.responseType = this.responseType || "text";
-        retryXhr.timeout = this.timeout;
-        for (const key in this._reqHeaders) {
-          try {
-            retryXhr.setRequestHeader(key, this._reqHeaders[key]);
-          } catch {}
-        }
-
-        this._native = retryXhr;
-        this._useNative = true;
-        this._nativeBound = true;
-        this.upload = retryXhr.upload;
-
-        const self = this;
-        for (let i = 0; i < XHR_EVENT_TYPES.length; i++) {
-          const type = XHR_EVENT_TYPES[i];
-          retryXhr.addEventListener(type, function (event) {
-            self._emit(type, event);
-          });
-        }
-
-        retryXhr.send(body === undefined ? null : body);
-      }
-
-      _applyResponse(buffer) {
-        const contentType = this.getResponseHeader("content-type") || this._mimeOverride || "application/octet-stream";
-
-        switch (this.responseType) {
-          case "arraybuffer":
-            this._response = buffer;
-            break;
-
-          case "blob":
-            this._response = new Blob([buffer], { type: contentType });
-            break;
-
-          case "json": {
-            const text = textDecoder.decode(buffer);
-            this._responseText = text;
-            try {
-              this._response = JSON.parse(text);
-            } catch {
-              this._response = null;
-            }
-            break;
-          }
-
-          case "document": {
-            const text = textDecoder.decode(buffer);
-            this._responseText = text;
-            try {
-              const mime = contentType.includes("xml") ? "application/xml" : "text/html";
-              this._response = new DOMParser().parseFromString(text, mime);
-              this._responseXML = this._response;
-            } catch {
-              this._response = null;
-            }
-            break;
-          }
-
-          default: {
-            const text = textDecoder.decode(buffer);
-            this._response = text;
-            this._responseText = text;
-          }
-        }
-      }
-
-      addEventListener(type, callback) {
-        let list = this._listeners.get(type);
-        if (!list) {
-          list = [];
-          this._listeners.set(type, list);
-        }
-        list.push(callback);
-      }
-
-      removeEventListener(type, callback) {
-        const list = this._listeners.get(type);
-        if (!list) return;
-        const idx = list.indexOf(callback);
-        if (idx !== -1) list.splice(idx, 1);
-      }
-
-      dispatchEvent(event) {
-        if (this._useNative && this._nativeBound) {
-          return this._native.dispatchEvent(event);
-        }
-        this._emit(event.type, event);
-        return !event.defaultPrevented;
-      }
-
-      open(method, url, async, username, password) {
-        if (this._timeoutId) {
-          clearTimeout(this._timeoutId);
-          this._timeoutId = null;
-        }
-
-        this._useNative = false;
-        this._method = method;
-        this._url = normalizeUrl(url) || url;
-        this._rule = findMatchingRule(this._url);
-        this._useNative = !this._rule;
-        this._aborted = false;
-        this._reqHeaders = {};
-        this._resHeaders = null;
-        this._mimeOverride = "";
-        this._responseXML = null;
-
-        this._status = 0;
-        this._statusText = "";
-        this._response = null;
-        this._responseText = "";
-        this._responseURL = "";
-
-        if (this._useNative) {
-          this._native.open(method, url, async !== undefined ? async : true, username, password);
-          return;
-        }
-
-        this._readyState = 1;
-        this._emit("readystatechange");
-      }
-
-      setRequestHeader(name, value) {
-        if (this._useNative) {
-          return this._native.setRequestHeader(name, value);
-        }
-        this._reqHeaders[name] = value;
-      }
-
-      getResponseHeader(name) {
-        if (this._useNative) {
-          return this._native.getResponseHeader(name);
-        }
-        if (!this._resHeaders) return null;
-        return this._resHeaders[name?.toLowerCase()] ?? null;
-      }
-
-      getAllResponseHeaders() {
-        if (this._useNative) {
-          return this._native.getAllResponseHeaders();
-        }
-        if (!this._resHeaders) return "";
-        const headers = this._resHeaders;
-        const keys = Object.keys(headers);
-        const parts = new Array(keys.length);
-        for (let i = 0; i < keys.length; i++) {
-          parts[i] = `${keys[i]}: ${headers[keys[i]]}`;
-        }
-        return parts.join("\r\n");
-      }
-
-      overrideMimeType(mime) {
-        if (this._useNative) {
-          return this._native.overrideMimeType(mime);
-        }
-        this._mimeOverride = mime;
-      }
-
       get responseXML() {
-        if (this._useNative) {
-          try {
-            return this._native.responseXML;
-          } catch {
-            return null;
-          }
-        }
-        return this._responseXML;
-      }
-
-      abort() {
-        if (this._useNative) {
-          return this._native.abort();
-        }
-
-        if (this._timeoutId) {
-          clearTimeout(this._timeoutId);
-          this._timeoutId = null;
-        }
-
-        this._aborted = true;
-
-        const state = this._readyState;
-        if (state !== 0 && state !== 4) {
-          this._status = 0;
-          this._statusText = "";
-          this._readyState = 4;
-          this._emit("readystatechange");
-          this._emit("abort");
-          this._emit("loadend");
-        }
-
-        this._readyState = 0;
-      }
-
-      async send(body) {
-        if (this._useNative) {
-          this._native.withCredentials = this.withCredentials;
-          this._native.responseType = this.responseType;
-          this._native.timeout = this.timeout;
-          this._bindNative();
-          return this._native.send(body === undefined ? null : body);
-        }
-
-        const { _rule: rule, _url: url, _method: method } = this;
-        const headers = { ...rule.requestHeaders, ...this._reqHeaders };
-        const includeCredentials = shouldIncludeCredentials(url, this.withCredentials ? "include" : undefined, this.withCredentials);
-        const wantBinary = this.responseType === "arraybuffer" || this.responseType === "blob";
-
-        const reqPromise = executeGmRequest({
-          url,
-          method,
-          headers,
-          data: normalizeRequestBody(body === undefined ? null : body),
-          responseType: wantBinary ? "arraybuffer" : "text",
-          withCredentials: includeCredentials,
-        });
-
-        let timeoutPromise;
-        if (this.timeout > 0) {
-          timeoutPromise = new Promise((_, reject) => {
-            this._timeoutId = setTimeout(() => reject(new Error("timeout")), this.timeout);
-          });
-        }
-
-        this._emit("loadstart");
-
+        if (!this._st) return super.responseXML;
+        if (this.responseType !== "" && this.responseType !== "document") return null;
+        if (this._st.responseXML !== undefined) return this._st.responseXML;
         try {
-          const response = await (timeoutPromise ? Promise.race([reqPromise, timeoutPromise]) : reqPromise);
-
-          if (this._timeoutId) {
-            clearTimeout(this._timeoutId);
-            this._timeoutId = null;
-          }
-          if (this._aborted) return;
-
-          this._resHeaders = buildResponseHeaders(response.responseHeaders, rule.responseHeaders, includeCredentials);
-          this._responseURL = response.finalUrl || url;
-          this._status = response.status;
-          this._statusText = response.statusText || "";
-
-          if (this._status === 0) {
-            return this._retryWithNative(body);
-          }
-
-          const buffer = responseToArrayBuffer(response);
-          const size = buffer.byteLength;
-
-          this._readyState = 2;
-          this._emit("readystatechange");
-
-          this._readyState = 3;
-          this._emit("readystatechange");
-          this._emit("progress", createXhrEvent("progress", size, size));
-
-          this._applyResponse(buffer);
-
-          this._readyState = 4;
-          this._emit("readystatechange");
-          this._emit("load", createXhrEvent("load", size, size));
-          this._emit("loadend", createXhrEvent("loadend", size, size));
-        } catch (err) {
-          if (this._timeoutId) {
-            clearTimeout(this._timeoutId);
-            this._timeoutId = null;
-          }
-          if (this._aborted) return;
-
-          return this._retryWithNative(body);
+          const parser = new DOMParser();
+          const contentType = this.getResponseHeader("content-type") || "";
+          const mime = contentType.includes("xml") ? "application/xml" : "text/html";
+          this._st.responseXML = parser.parseFromString(this._st.responseText, mime);
+        } catch {
+          this._st.responseXML = null;
         }
+        return this._st.responseXML;
       }
-    }
+      getAllResponseHeaders() {
+        if (!this._st) return super.getAllResponseHeaders();
+        const headers = [];
+        this._st.resHeaders.forEach((v, k) => headers.push(`${k}: ${v}`));
+        return headers.join("\r\n");
+      }
+      getResponseHeader(name) {
+        if (!this._st) return super.getResponseHeader(name);
+        return this._st.resHeaders.get(name);
+      }
+    };
+  };
 
-    Object.assign(ProxyXMLHttpRequest, XHR_STATES);
-    Object.assign(ProxyXMLHttpRequest.prototype, XHR_STATES);
-    globalContext.XMLHttpRequest = ProxyXMLHttpRequest;
-  }
+  const patchMedia = () => {
+    const proto = win.HTMLMediaElement.prototype;
+    const origSet = Object.getOwnPropertyDescriptor(proto, "src")?.set;
+    const origSetAttr = proto.setAttribute;
 
-  function patchMediaElements() {
-    if (patchStatus.media) return;
-    patchStatus.media = true;
+    const cleanupElement = (el) => {
+      if (mediaBlobs.has(el)) {
+        URL.revokeObjectURL(mediaBlobs.get(el));
+        mediaBlobs.delete(el);
+      }
+      if (activeMediaReqs.has(el)) {
+        activeMediaReqs.get(el).abort();
+        activeMediaReqs.delete(el);
+      }
+    };
 
-    const proto = globalContext.HTMLMediaElement.prototype;
-    const srcDesc = Object.getOwnPropertyDescriptor(proto, "src");
-    const nativeSetAttr = proto.setAttribute;
+    const intercept = async (el, val, setter) => {
+      if (mediaBlobs.has(el) && mediaBlobs.get(el) === val) return;
 
-    if (srcDesc?.set) {
-      const originalSet = srcDesc.set;
+      cleanupElement(el);
+      setter.call(el, val);
 
-      Object.defineProperty(proto, "src", {
-        ...srcDesc,
-        set(value) {
-          if (typeof value !== "string") {
-            originalSet.call(this, value);
+      const urlStr = normalizeUrl(val);
+      const rule = getRule(urlStr);
+      if (!rule) return;
+
+      const controller = new AbortController();
+      activeMediaReqs.set(el, controller);
+
+      try {
+        if (!RE_STREAM_MANIFEST.test(urlStr)) {
+          const head = await gmFetch({ method: "HEAD", url: urlStr, headers: rule.requestHeaders, signal: controller.signal });
+          const map = parseHeaders(head.responseHeaders);
+          const len = parseInt(map.get("content-length") || "0", 10);
+          const contentType = map.get("content-type");
+          const acceptRanges = map.get("accept-ranges");
+          if (
+            contentType &&
+            RE_CONTENT_MEDIA.test(contentType) &&
+            (acceptRanges?.includes("bytes") || len > CONFIG.maxMediaSize || isNaN(len))
+          )
             return;
-          }
+        }
 
-          originalSet.call(this, value);
-          proxyMediaSrc(this, value, originalSet);
+        const res = await gmFetch({
+          method: "GET",
+          url: urlStr,
+          headers: rule.requestHeaders,
+          responseType: "arraybuffer",
+          signal: controller.signal,
+        });
+        if (!res || el.src !== urlStr) return;
+
+        const blob = new Blob([res.response], {
+          type: parseHeaders(res.responseHeaders).get("content-type") || "application/octet-stream",
+        });
+        const url = URL.createObjectURL(blob);
+
+        if (mediaBlobs.has(el)) URL.revokeObjectURL(mediaBlobs.get(el));
+        mediaBlobs.set(el, url);
+        setter.call(el, url);
+      } catch (e) {
+        if (e.message !== "Aborted") console.warn(`${CONFIG.logPrefix} Media proxy failed`, e);
+      }
+    };
+
+    if (origSet) {
+      Object.defineProperty(proto, "src", {
+        set(v) {
+          typeof v === "string" ? intercept(this, v, origSet) : origSet.call(this, v);
         },
       });
     }
 
-    proto.setAttribute = function (name, value) {
-      if (name?.toLowerCase() !== "src" || typeof value !== "string") {
-        return nativeSetAttr.call(this, name, value);
-      }
-
-      nativeSetAttr.call(this, "src", value);
-      proxyMediaSrc(this, value, nativeSetAttr);
+    proto.setAttribute = function (n, v) {
+      if (n.toLowerCase() === "src" && typeof v === "string") intercept(this, v, (u) => origSetAttr.call(this, "src", u));
+      else origSetAttr.call(this, n, v);
     };
 
-    if (!mediaObserver) {
-      mediaObserver = new MutationObserver((mutations) => {
-        for (let m = 0; m < mutations.length; m++) {
-          const removed = mutations[m].removedNodes;
-          for (let n = 0; n < removed.length; n++) {
-            const node = removed[n];
-            if (node instanceof HTMLMediaElement) {
-              const blobUrl = mediaBlobMap.get(node);
-              if (blobUrl) {
-                URL.revokeObjectURL(blobUrl);
-                mediaBlobMap.delete(node);
-              }
-            }
-            if (node.nodeType === 1) {
-              const children = node.querySelectorAll?.("video, audio");
-              if (children) {
-                for (let c = 0; c < children.length; c++) {
-                  const child = children[c];
-                  const blobUrl = mediaBlobMap.get(child);
-                  if (blobUrl) {
-                    URL.revokeObjectURL(blobUrl);
-                    mediaBlobMap.delete(child);
-                  }
-                }
+    const origRemoveAttr = proto.removeAttribute;
+    proto.removeAttribute = function (n) {
+      if (n.toLowerCase() === "src") cleanupElement(this);
+      origRemoveAttr.call(this, n);
+    };
+
+    new MutationObserver((muts) => {
+      for (let i = 0; i < muts.length; i++) {
+        const removed = muts[i].removedNodes;
+        for (let j = 0; j < removed.length; j++) {
+          const n = removed[j];
+          if (n instanceof HTMLMediaElement) {
+            cleanupElement(n);
+          } else if (n.nodeType === 1) {
+            const children = n.querySelectorAll?.("video, audio");
+            if (children) {
+              for (let k = 0; k < children.length; k++) {
+                cleanupElement(children[k]);
               }
             }
           }
         }
-      });
-
-      const root = document.documentElement || document.body;
-      if (root) {
-        mediaObserver.observe(root, { childList: true, subtree: true });
       }
-    }
+    }).observe(document, { childList: true, subtree: true });
+  };
 
-    globalContext.addEventListener("beforeunload", cleanupStreamData);
-  }
-
-  function installProxies() {
-    patchFetch();
-    patchXhr();
-    patchMediaElements();
-  }
-
-  const messageHandlers = {
-    hello() {
-      return {
-        success: true,
-        version: VERSION,
-        allowed: true,
-        hasPermission: true,
-      };
-    },
+  const handlers = {
+    hello: () => ({
+      success: true,
+      version: CONFIG.extensionVersion,
+      allowed: true,
+      hasPermission: true,
+    }),
 
     async makeRequest(body) {
-      if (!body) throw new Error("Missing request body");
+      const url = new URL(body.url, body.baseUrl || win.location.href);
+      if (body.query) {
+        for (const k in body.query) url.searchParams.set(k, body.query[k]);
+      }
 
-      const url = buildUrl(body.url, body);
-      const includeCredentials = shouldIncludeCredentials(url, body.credentials, body.withCredentials);
+      let data = body.body;
+      const reqHeaders = { ...body.headers };
 
-      const response = await executeGmRequest({
-        url,
+      if (body.bodyType === "FormData" && Array.isArray(data)) {
+        const fd = new FormData();
+        for (let i = 0; i < data.length; i++) fd.append(data[i][0], data[i][1]);
+        data = fd;
+
+        const ctKey = Object.keys(reqHeaders).find((k) => k.toLowerCase() === "content-type");
+        if (ctKey) delete reqHeaders[ctKey];
+      } else if (body.bodyType === "URLSearchParams") {
+        data = new URLSearchParams(data);
+      } else if (body.bodyType === "object") {
+        data = JSON.stringify(data);
+      }
+
+      const res = await gmFetch({
         method: body.method || "GET",
-        headers: body.headers,
-        data: deserializeRequestBody(body.body, body.bodyType),
+        url: url.href,
+        headers: reqHeaders,
+        data,
         responseType: "arraybuffer",
-        withCredentials: includeCredentials,
+        withCredentials: shouldIncludeCredentials(url.href, body.credentials, body.withCredentials),
       });
 
-      const headers = buildResponseHeaders(response.responseHeaders, null, includeCredentials);
-      const text = textDecoder.decode(responseToArrayBuffer(response));
-      const contentType = headers["content-type"] || "";
+      const h = parseHeaders(res.responseHeaders);
+      const headers = {};
+      h.forEach((v, k) => (headers[k] = v));
 
-      let parsedBody = text;
-      if (contentType.includes("application/json")) {
+      let resBody = new TextDecoder().decode(res.response);
+      if (headers["content-type"]?.includes("json")) {
         try {
-          parsedBody = JSON.parse(text);
+          resBody = JSON.parse(resBody);
         } catch {}
       }
 
-      return {
-        success: true,
-        response: {
-          statusCode: response.status,
-          headers,
-          finalUrl: response.finalUrl || url,
-          body: parsedBody,
-        },
-      };
+      return { success: true, response: { statusCode: res.status, headers, finalUrl: res.finalUrl || url.href, body: resBody } };
     },
 
     async prepareStream(body) {
-      if (!body) throw new Error("Missing request body");
-
-      cleanupStreamData();
-
-      const existing = proxyRules.get(body.ruleId);
-      if (existing?.targetRegex) {
-        regexCache.delete(existing.targetRegex);
-      }
-
       const responseHeaders = {};
       if (body.responseHeaders) {
-        const src = body.responseHeaders;
-        const keys = Object.keys(src);
-        for (let i = 0; i < keys.length; i++) {
-          const lower = keys[i].toLowerCase();
-          if (MODIFIABLE_HEADERS.has(lower)) {
-            responseHeaders[lower] = src[keys[i]];
-          }
+        for (const k in body.responseHeaders) {
+          const lowerK = k.toLowerCase();
+          if (MODIFIABLE_HEADERS.has(lowerK)) responseHeaders[lowerK] = body.responseHeaders[k];
         }
       }
 
-      proxyRules.set(body.ruleId, { ...body, responseHeaders });
-      installProxies();
+      const rule = { ...body, responseHeaders };
+      if (rule.targetRegex) {
+        try {
+          rule._compiledRegex = new RegExp(rule.targetRegex);
+        } catch (e) {
+          console.warn(`${CONFIG.logPrefix} Invalid rule regex`, rule.targetRegex);
+        }
+      }
+      rules.set(body.ruleId, rule);
 
+      if (!patchStatus) {
+        patchFetch();
+        patchXhr();
+        patchMedia();
+        patchStatus = true;
+      }
       return { success: true };
     },
 
     openPage(body) {
-      if (body?.redirectUrl) {
-        globalContext.location.href = body.redirectUrl;
-      }
+      if (body?.redirectUrl) win.location.href = body.redirectUrl;
       return { success: true };
     },
   };
 
-  function setupMessageRelay(name, handler, expectedId) {
-    globalContext.addEventListener("message", async (event) => {
-      const data = event.data;
-      if (event.source !== globalContext || data?.name !== name || data?.relayed) {
-        return;
-      }
+  win.addEventListener("message", async (e) => {
+    const data = e.data;
+    if (e.source !== win || !data || data.relayed || !handlers[data.name]) return;
 
-      if (expectedId !== undefined && data.relayId !== expectedId) return;
-
-      const { instanceId, body } = data;
-
-      try {
-        const result = await handler(body);
-        globalContext.postMessage({ name, instanceId, body: result, relayed: true }, "/");
-      } catch (err) {
-        console.error(LOG_PREFIX, `${name} handler failed:`, err.message);
-        globalContext.postMessage(
-          {
-            name,
-            instanceId,
-            body: { success: false, error: err.message || String(err) },
-            relayed: true,
-          },
-          "/",
-        );
-      }
-    });
-  }
-
-  const handlerNames = Object.keys(messageHandlers);
-  for (let i = 0; i < handlerNames.length; i++) {
-    const name = handlerNames[i];
-    setupMessageRelay(name, messageHandlers[name]);
-  }
-})();
+    try {
+      const result = await handlers[data.name](data.body);
+      win.postMessage({ name: data.name, instanceId: data.instanceId, body: result, relayed: true }, pageOrigin);
+    } catch (err) {
+      win.postMessage(
+        { name: data.name, instanceId: data.instanceId, body: { success: false, error: err.message }, relayed: true },
+        pageOrigin,
+      );
+    }
+  });
+})(typeof GM_xmlhttpRequest !== "undefined" ? GM_xmlhttpRequest : GM?.xmlHttpRequest);
