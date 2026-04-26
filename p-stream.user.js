@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         P-Stream Userscript
 // @namespace    groknt
-// @version      1.5.3
+// @version      1.6.0
 // @description  A P-Stream compatible userscript
 // @author       groknt
 // @license      MIT
@@ -18,7 +18,7 @@
 (function () {
   "use strict";
 
-  const VERSION = "1.5.3";
+  const VERSION = "1.6.0";
   const LOG_PREFIX = "P-Stream:";
 
   const MODIFIABLE_HEADERS = new Set([
@@ -62,9 +62,10 @@
   })();
 
   const proxyRules = new Map();
-  const blobUrlRegistry = new Set();
   const proxyCache = new Map();
   const regexCache = new Map();
+  const mediaBlobMap = new WeakMap();
+  let mediaObserver = null;
   const patchStatus = { fetch: false, xhr: false, media: false };
 
   const textDecoder = new TextDecoder();
@@ -297,18 +298,10 @@
   }
 
   function createBlobUrl(data, contentType) {
-    const url = URL.createObjectURL(new Blob([data], { type: contentType || "application/octet-stream" }));
-    blobUrlRegistry.add(url);
-    return url;
+    return URL.createObjectURL(new Blob([data], { type: contentType || "application/octet-stream" }));
   }
 
   function cleanupStreamData() {
-    for (const url of blobUrlRegistry) {
-      try {
-        URL.revokeObjectURL(url);
-      } catch {}
-    }
-    blobUrlRegistry.clear();
     proxyCache.clear();
   }
 
@@ -346,7 +339,7 @@
         const contentType = parseResponseHeaders(response.responseHeaders)["content-type"] || "";
         if (isStreamingContent(contentType, normalized)) return null;
 
-        return createBlobUrl(responseToArrayBuffer(response), contentType);
+        return { data: responseToArrayBuffer(response), contentType };
       } catch (err) {
         console.warn(LOG_PREFIX, "Media proxy failed:", err.message);
         return null;
@@ -363,11 +356,20 @@
     const normalized = normalizeUrl(value);
     if (!normalized) return;
 
+    const expectedSrc = normalized;
+
+    const oldBlob = mediaBlobMap.get(element);
+    if (oldBlob) {
+      URL.revokeObjectURL(oldBlob);
+      mediaBlobMap.delete(element);
+    }
+
     proxyMediaSource(value)
-      .then((proxied) => {
-        if (proxied && element.src === normalized) {
-          nativeSetter.call(element, proxied);
-        }
+      .then((result) => {
+        if (!result || element.src !== expectedSrc) return;
+        const blobUrl = createBlobUrl(result.data, result.contentType);
+        mediaBlobMap.set(element, blobUrl);
+        nativeSetter.call(element, blobUrl);
       })
       .catch(() => {});
   }
@@ -462,12 +464,12 @@
         this._nativeBound = false;
         this._responseXML = null;
 
-        this.readyState = 0;
-        this.status = 0;
-        this.statusText = "";
-        this.response = null;
-        this.responseText = "";
-        this.responseURL = "";
+        this._readyState = 0;
+        this._status = 0;
+        this._statusText = "";
+        this._response = null;
+        this._responseText = "";
+        this._responseURL = "";
         this.responseType = "";
         this.withCredentials = false;
         this.timeout = 0;
@@ -508,25 +510,91 @@
         }
       }
 
-      _syncNative() {
-        if (!this._useNative) return;
-        try {
-          this.readyState = this._native.readyState;
-          if (this.readyState >= 2) {
-            this.status = this._native.status;
-            this.statusText = this._native.statusText;
+      get readyState() {
+        if (this._useNative) {
+          try {
+            return this._native.readyState;
+          } catch {
+            return this._readyState;
           }
-          if (this.readyState >= 3) {
-            this.response = this._native.response;
+        }
+        return this._readyState;
+      }
+      set readyState(value) {
+        this._readyState = value;
+      }
+
+      get status() {
+        if (this._useNative) {
+          try {
+            return this._native.status;
+          } catch {
+            return this._status;
           }
-          if (this.readyState === 4) {
-            this.responseURL = this._native.responseURL;
+        }
+        return this._status;
+      }
+      set status(value) {
+        this._status = value;
+      }
+
+      get statusText() {
+        if (this._useNative) {
+          try {
+            return this._native.statusText;
+          } catch {
+            return this._statusText;
+          }
+        }
+        return this._statusText;
+      }
+      set statusText(value) {
+        this._statusText = value;
+      }
+
+      get response() {
+        if (this._useNative) {
+          try {
+            return this._native.response;
+          } catch {
+            return this._response;
+          }
+        }
+        return this._response;
+      }
+      set response(value) {
+        this._response = value;
+      }
+
+      get responseText() {
+        if (this._useNative) {
+          try {
             const nativeResponseType = this._native.responseType;
             if (!nativeResponseType || nativeResponseType === "text") {
-              this.responseText = this._native.responseText;
+              return this._native.responseText;
             }
+          } catch {
+            return this._responseText;
           }
-        } catch {}
+        }
+        return this._responseText;
+      }
+      set responseText(value) {
+        this._responseText = value;
+      }
+
+      get responseURL() {
+        if (this._useNative) {
+          try {
+            return this._native.responseURL;
+          } catch {
+            return this._responseURL;
+          }
+        }
+        return this._responseURL;
+      }
+      set responseURL(value) {
+        this._responseURL = value;
       }
 
       _bindNative() {
@@ -537,10 +605,37 @@
         for (let i = 0; i < XHR_EVENT_TYPES.length; i++) {
           const type = XHR_EVENT_TYPES[i];
           this._native.addEventListener(type, function (event) {
-            self._syncNative();
             self._emit(type, event);
           });
         }
+      }
+
+      _retryWithNative(body) {
+        const retryXhr = new NativeXHR();
+        retryXhr.open(this._method, this._url, true);
+        retryXhr.withCredentials = this.withCredentials;
+        retryXhr.responseType = this.responseType || "text";
+        retryXhr.timeout = this.timeout;
+        for (const key in this._reqHeaders) {
+          try {
+            retryXhr.setRequestHeader(key, this._reqHeaders[key]);
+          } catch {}
+        }
+
+        this._native = retryXhr;
+        this._useNative = true;
+        this._nativeBound = true;
+        this.upload = retryXhr.upload;
+
+        const self = this;
+        for (let i = 0; i < XHR_EVENT_TYPES.length; i++) {
+          const type = XHR_EVENT_TYPES[i];
+          retryXhr.addEventListener(type, function (event) {
+            self._emit(type, event);
+          });
+        }
+
+        retryXhr.send(body === undefined ? null : body);
       }
 
       _applyResponse(buffer) {
@@ -548,41 +643,41 @@
 
         switch (this.responseType) {
           case "arraybuffer":
-            this.response = buffer;
+            this._response = buffer;
             break;
 
           case "blob":
-            this.response = new Blob([buffer], { type: contentType });
+            this._response = new Blob([buffer], { type: contentType });
             break;
 
           case "json": {
             const text = textDecoder.decode(buffer);
-            this.responseText = text;
+            this._responseText = text;
             try {
-              this.response = JSON.parse(text);
+              this._response = JSON.parse(text);
             } catch {
-              this.response = null;
+              this._response = null;
             }
             break;
           }
 
           case "document": {
             const text = textDecoder.decode(buffer);
-            this.responseText = text;
+            this._responseText = text;
             try {
               const mime = contentType.includes("xml") ? "application/xml" : "text/html";
-              this.response = new DOMParser().parseFromString(text, mime);
-              this._responseXML = this.response;
+              this._response = new DOMParser().parseFromString(text, mime);
+              this._responseXML = this._response;
             } catch {
-              this.response = null;
+              this._response = null;
             }
             break;
           }
 
           default: {
             const text = textDecoder.decode(buffer);
-            this.response = text;
-            this.responseText = text;
+            this._response = text;
+            this._responseText = text;
           }
         }
       }
@@ -617,6 +712,7 @@
           this._timeoutId = null;
         }
 
+        this._useNative = false;
         this._method = method;
         this._url = normalizeUrl(url) || url;
         this._rule = findMatchingRule(this._url);
@@ -627,19 +723,18 @@
         this._mimeOverride = "";
         this._responseXML = null;
 
-        this.status = 0;
-        this.statusText = "";
-        this.response = null;
-        this.responseText = "";
-        this.responseURL = "";
+        this._status = 0;
+        this._statusText = "";
+        this._response = null;
+        this._responseText = "";
+        this._responseURL = "";
 
         if (this._useNative) {
           this._native.open(method, url, async !== undefined ? async : true, username, password);
-          this.readyState = this._native.readyState;
           return;
         }
 
-        this.readyState = 1;
+        this._readyState = 1;
         this._emit("readystatechange");
       }
 
@@ -702,17 +797,17 @@
 
         this._aborted = true;
 
-        const state = this.readyState;
+        const state = this._readyState;
         if (state !== 0 && state !== 4) {
-          this.status = 0;
-          this.statusText = "";
-          this.readyState = 4;
+          this._status = 0;
+          this._statusText = "";
+          this._readyState = 4;
           this._emit("readystatechange");
           this._emit("abort");
           this._emit("loadend");
         }
 
-        this.readyState = 0;
+        this._readyState = 0;
       }
 
       async send(body) {
@@ -757,23 +852,27 @@
           if (this._aborted) return;
 
           this._resHeaders = buildResponseHeaders(response.responseHeaders, rule.responseHeaders, includeCredentials);
-          this.responseURL = response.finalUrl || url;
-          this.status = response.status;
-          this.statusText = response.statusText || "";
+          this._responseURL = response.finalUrl || url;
+          this._status = response.status;
+          this._statusText = response.statusText || "";
+
+          if (this._status === 0) {
+            return this._retryWithNative(body);
+          }
 
           const buffer = responseToArrayBuffer(response);
           const size = buffer.byteLength;
 
-          this.readyState = 2;
+          this._readyState = 2;
           this._emit("readystatechange");
 
-          this.readyState = 3;
+          this._readyState = 3;
           this._emit("readystatechange");
           this._emit("progress", createXhrEvent("progress", size, size));
 
           this._applyResponse(buffer);
 
-          this.readyState = 4;
+          this._readyState = 4;
           this._emit("readystatechange");
           this._emit("load", createXhrEvent("load", size, size));
           this._emit("loadend", createXhrEvent("loadend", size, size));
@@ -784,16 +883,7 @@
           }
           if (this._aborted) return;
 
-          this.status = 0;
-          this.statusText = err.message || "";
-          this.readyState = 4;
-
-          const msg = err.message || "";
-          const isTimeout = msg === "timeout" || msg === "Request timeout";
-          const type = isTimeout ? "timeout" : "error";
-          this._emit("readystatechange");
-          this._emit(type);
-          this._emit("loadend");
+          return this._retryWithNative(body);
         }
       }
     }
@@ -836,6 +926,42 @@
       nativeSetAttr.call(this, "src", value);
       proxyMediaSrc(this, value, nativeSetAttr);
     };
+
+    if (!mediaObserver) {
+      mediaObserver = new MutationObserver((mutations) => {
+        for (let m = 0; m < mutations.length; m++) {
+          const removed = mutations[m].removedNodes;
+          for (let n = 0; n < removed.length; n++) {
+            const node = removed[n];
+            if (node instanceof HTMLMediaElement) {
+              const blobUrl = mediaBlobMap.get(node);
+              if (blobUrl) {
+                URL.revokeObjectURL(blobUrl);
+                mediaBlobMap.delete(node);
+              }
+            }
+            if (node.nodeType === 1) {
+              const children = node.querySelectorAll?.("video, audio");
+              if (children) {
+                for (let c = 0; c < children.length; c++) {
+                  const child = children[c];
+                  const blobUrl = mediaBlobMap.get(child);
+                  if (blobUrl) {
+                    URL.revokeObjectURL(blobUrl);
+                    mediaBlobMap.delete(child);
+                  }
+                }
+              }
+            }
+          }
+        }
+      });
+
+      const root = document.documentElement || document.body;
+      if (root) {
+        mediaObserver.observe(root, { childList: true, subtree: true });
+      }
+    }
 
     globalContext.addEventListener("beforeunload", cleanupStreamData);
   }
@@ -929,12 +1055,14 @@
     },
   };
 
-  function setupMessageRelay(name, handler) {
+  function setupMessageRelay(name, handler, expectedId) {
     globalContext.addEventListener("message", async (event) => {
       const data = event.data;
       if (event.source !== globalContext || data?.name !== name || data?.relayed) {
         return;
       }
+
+      if (expectedId !== undefined && data.relayId !== expectedId) return;
 
       const { instanceId, body } = data;
 
