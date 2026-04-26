@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         P-Stream Userscript
 // @namespace    groknt
-// @version      2.0.1
+// @version      2.0.2
 // @description  A P-Stream compatible userscript
 // @author       groknt
 // @license      MIT
@@ -27,8 +27,10 @@
     },
   };
 
-  const win = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
   if (!GM) console.warn(`${CONFIG.logPrefix} GM_xmlhttpRequest missing - proxy will fail`);
+
+  const win = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+  const sharedDecoder = new TextDecoder();
 
   const pageOrigin = win.location.origin !== "null" ? win.location.origin : new URL(win.location.href).origin || "*";
   const rules = new Map();
@@ -559,7 +561,7 @@
       const headers = {};
       h.forEach((v, k) => (headers[k] = v));
 
-      let resBody = new TextDecoder().decode(res.response);
+      let resBody = sharedDecoder.decode(res.response);
       if (headers["content-type"]?.includes("json")) {
         try {
           resBody = JSON.parse(resBody);
